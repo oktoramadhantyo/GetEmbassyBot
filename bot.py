@@ -1,22 +1,41 @@
 # -*- coding: utf-8 -*-
-"""Bot Telegram GetEmbassy — memeriksa nomor embassy di Web Gladius.
+"""Bot Telegram GetEmbassy (sisi Railway).
 
-Perintah:
-  /embassy <nomor>  -> cek kualitas jaringan & kirim screenshot
-  /status           -> cek koneksi server Gladius (Chrome debug port)
-  /start, /help     -> bantuan
+Menerima perintah dari user, mencatat permintaan cek embassy ke antrian
+in-memory, lalu menyediakan endpoint HTTP publik yang ditanya-tanya oleh
+agent lokal (laptop PIC) yang memegang Chrome + Gladius.
+
+Alur:
+  /embassy <nomor>  -> tulis antrian + balas "Embassy: mengukur ..."
+  agent lokal       -> GET /antrian -> proses Selenium -> kirim hasil langsung
+                       ke user (sendPhoto/editMessageText) -> POST /selesai
+  Jika antrian tidak diproses dalam WAIT_ANNOUNCE_MENIT menit, pesan status
+  diedit menjadi "Server Gladius tidak tersambung".
+
+Endpoint HTTP (semua butuh ?secret=AGENT_SECRET):
+  GET  /antrian   -> daftar permintaan status=pending
+  POST /selesai   -> agent melaporkan hasil (id, status, pesan)
+  GET  /health    -> penanda bot hidup
 """
 
 import asyncio
+import json
 import logging
 import re
 import threading
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from config import TOKEN
-from scraper import browser, embassy
+from config import (
+    AGENT_SECRET,
+    PORT_HTTP,
+    TOKEN,
+    WAIT_ANNOUNCE_MENIT,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -24,17 +43,155 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Anti-bentrok: satu pengukuran pada satu waktu.
-_lock = threading.Lock()
+# ==================== ANTRIAN (in-memory) ====================
+# task_id -> {"nomor", "chat_id", "message_id", "waktu", "status", "pesan"}
+_antrian: dict[str, dict] = {}
+_antrian_lock = threading.Lock()
+_id_counter = 0
 
+
+def _tambah_task(nomor: str, chat_id: int, message_id: int) -> str:
+    global _id_counter
+    with _antrian_lock:
+        _id_counter += 1
+        task_id = f"T-{_id_counter}"
+        _antrian[task_id] = {
+            "nomor": nomor,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "waktu": datetime.now().isoformat(timespec="seconds"),
+            "status": "pending",
+            "pesan": "",
+        }
+        return task_id
+
+
+def _ambil_task(task_id: str) -> dict | None:
+    with _antrian_lock:
+        return _antrian.get(task_id)
+
+
+def _ambil_pending() -> list[dict]:
+    with _antrian_lock:
+        return [
+            {
+                "id": i,
+                "nomor": t["nomor"],
+                "chat_id": t["chat_id"],
+                "message_id": t["message_id"],
+            }
+            for i, t in _antrian.items()
+            if t["status"] == "pending"
+        ]
+
+
+def _tandai_task(task_id: str, status: str, pesan: str = "") -> None:
+    with _antrian_lock:
+        if task_id in _antrian:
+            _antrian[task_id]["status"] = status
+            _antrian[task_id]["pesan"] = pesan
+
+
+def _ringkasan_status() -> str:
+    with _antrian_lock:
+        if not _antrian:
+            return (
+                "Bot online ✓\n"
+                "Belum ada permintaan /embassy terakhir.\n"
+                "Kirim /embassy <nomor> lalu lihat apakah ada balasan hasil."
+            )
+        terakhir = max(_antrian.values(), key=lambda t: t["waktu"])
+        st = terakhir["status"]
+        jam = terakhir["waktu"].replace("T", " ")[:19]
+        if st == "pending":
+            kondisi = "permintaan terakhir masih menunggu agent (agent/Gladius belum merespons)."
+        elif st == "selesai":
+            kondisi = "agent aktif ✓ (permintaan terakhir selesai diproses)."
+        else:
+            kondisi = "agent tidak terdeteksi pada permintaan terakhir."
+        return f"Bot online ✓\n{kondisi}\nTerakhir: {jam} ({st})"
+
+
+# ==================== HTTP ENDPOINT (dipanggil agent lokal) ====================
+class _Handler(BaseHTTPRequestHandler):
+    def _kirim(self, kode: int, obj) -> None:
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(kode)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _sekret_ok(self) -> bool:
+        qs = parse_qs(urlparse(self.path).query)
+        return (qs.get("secret", [""])[0] or "") == AGENT_SECRET
+
+    def _baca_json(self) -> dict:
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            if n <= 0:
+                return {}
+            return json.loads(self.rfile.read(n).decode("utf-8"))
+        except Exception:
+            return {}
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/health":
+            self._kirim(200, {"ok": True})
+            return
+        if not self._sekret_ok():
+            self._kirim(403, {"ok": False, "error": "secret salah"})
+            return
+        if path == "/antrian":
+            self._kirim(200, {"ok": True, "items": _ambil_pending()})
+        else:
+            self._kirim(404, {"ok": False})
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if not self._sekret_ok():
+            self._kirim(403, {"ok": False, "error": "secret salah"})
+            return
+        if path == "/selesai":
+            data = self._baca_json()
+            tid = str(data.get("id", ""))
+            status = data.get("status", "selesai")
+            pesan = data.get("pesan", "")
+            if tid:
+                _tandai_task(tid, status, pesan)
+            self._kirim(200, {"ok": True})
+        else:
+            self._kirim(404, {"ok": False})
+
+    def log_message(self, *args):
+        pass
+
+
+def _jalankan_http_server() -> None:
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", PORT_HTTP), _Handler)
+        logger.info("HTTP endpoint aktif di port %s", PORT_HTTP)
+        server.serve_forever()
+    except Exception as exc:
+        logger.warning("HTTP server gagal: %s", exc)
+
+
+# ==================== PERINTAH TELEGRAM ====================
 BANTUAN_TEXT = (
     "GetEmbassy Bot\n\n"
     "Cara pakai:\n"
     "/embassy <nomor>  cek kualitas jaringan embassy & kirim hasil (1 screenshot)\n"
-    "/status           cek apakah server Gladius tersambung\n"
+    "/status           cek status bot / agent\n"
     "/start /help      bantuan ini\n\n"
     "Contoh:\n"
     "/embassy 121519246796"
+)
+
+PESAN_TIDAK_TERSAMBUNG = (
+    "⚠️ Server Gladius tidak tersambung.\n"
+    "Petugas yang menjaga bot belum aktif / Chrome Gladius belum berjalan.\n"
+    "Silakan dicoba lagi nanti."
 )
 
 
@@ -44,17 +201,8 @@ async def cmd_bantuan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    if browser.cek_debug_port_terbuka():
-        await update.message.reply_text("Tersambung ✓ (Chrome debug port aktif)")
-    else:
-        await update.message.reply_text(
-            "Tidak tersambung ✗\n\n"
-            "Pastikan Chrome sudah berjalan dengan remote debugging:\n"
-            'chrome.exe --remote-debugging-port=9222 --user-data-dir="C:\\chrome-debug"\n'
-            "lalu login Gladius."
-        )
+    if update.message:
+        await update.message.reply_text(_ringkasan_status())
 
 
 async def cmd_embassy(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -70,52 +218,35 @@ async def cmd_embassy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    status = await msg.reply_text(f"Embassy: mengukur {nomor}")
+    status_msg = await msg.reply_text(f"Embassy: mengukur {nomor}")
+    task_id = _tambah_task(nomor, msg.chat_id, status_msg.message_id)
+    logger.info("Antrian %s: nomor %s dari chat %s", task_id, nomor, msg.chat_id)
 
-    if not browser.cek_debug_port_terbuka():
-        await status.edit_text(
-            "⚠️ Server Gladius tidak tersambung.\n\n"
-            "Pastikan Chrome sudah berjalan dengan remote debugging:\n"
-            'chrome.exe --remote-debugging-port=9222 --user-data-dir="C:\\chrome-debug"\n'
-            "lalu login Gladius, dan ulangi:\n"
-            f"/embassy {nomor}"
-        )
+    context.application.create_task(
+        _pantau_timeout(context.application, task_id, nomor)
+    )
+
+
+async def _pantau_timeout(application, task_id: str, nomor: str) -> None:
+    await asyncio.sleep(WAIT_ANNOUNCE_MENIT * 60)
+    task = _ambil_task(task_id)
+    if not task or task["status"] != "pending":
         return
-
     try:
-        with _lock:
-            driver = browser.buat_driver()
-            try:
-                hasil = await asyncio.to_thread(embassy.cek_embassy, driver, nomor)
-            finally:
-                browser.tutup(driver)
-    except Exception as exc:
-        logger.exception("Gagal cek embassy")
-        await status.edit_text(_teks_eror(exc, nomor))
-        return
-
-    caption = f"Embassy {hasil['nomor']} | {hasil['waktu']}"
-    if not hasil.get("lfu_ok"):
-        caption += (
-            "\nLast Five Usage gagal atau tidak selesai dimuat. "
-            "Gambar berikut adalah hasil Embassy sebelum percobaan riwayat."
+        await application.bot.edit_message_text(
+            chat_id=task["chat_id"],
+            message_id=task["message_id"],
+            text=PESAN_TIDAK_TERSAMBUNG,
         )
-
-    try:
-        with open(hasil["screenshot"], "rb") as f:
-            await msg.reply_photo(photo=f, caption=caption)
-        await status.edit_text("Selesai ✓")
     except Exception as exc:
-        logger.exception("Gagal kirim foto")
-        await status.edit_text(f"Gagal mengirim foto: {exc}")
+        logger.warning("Gagal edit pesan timeout: %s", exc)
+    _tandai_task(task_id, "timeout", "tidak diproses agent")
 
 
-def _teks_eror(exc: Exception, nomor: str) -> str:
-    teks = f"Gagal memeriksa Embassy {nomor}:\n{exc}"
-    return teks[:400]
-
-
+# ==================== MAIN ====================
 def main() -> None:
+    threading.Thread(target=_jalankan_http_server, daemon=True).start()
+
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler(["start", "help"], cmd_bantuan))
     app.add_handler(CommandHandler("status", cmd_status))

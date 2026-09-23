@@ -19,7 +19,24 @@ if not TOKEN:
         "atau set environment variable TELEGRAM_BOT_TOKEN."
     )
 
-# ==================== SELENIUM / BROWSER ====================
+# ==================== RELAY RAILWAY <-> AGENT LOKAL ====================
+# URL publik bot di Railway (dipakai agent lokal untuk menanyakan antrian).
+RAILWAY_URL = os.getenv("RAILWAY_URL", "").strip().rstrip("/")
+
+# Kata kunci rahasia antara bot (Railway) dan agent lokal.
+AGENT_SECRET = os.getenv("AGENT_SECRET", "").strip()
+
+# Agent lokal meminta antrian tiap N detik.
+AGENT_INTERVAL_DETIK = int(os.getenv("AGENT_INTERVAL_DETIK", "10"))
+
+# Jika antrian pending tidak diproses agent dalam N menit, bot meng-edit pesan
+# status menjadi "Server Gladius tidak tersambung".
+WAIT_ANNOUNCE_MENIT = int(os.getenv("WAIT_ANNOUNCE_MENIT", "3"))
+
+# Port HTTP endpoint (Railway menyuntikkan $PORT; default 8080).
+PORT_HTTP = int(os.getenv("PORT", "8080"))
+
+# ==================== SELENIUM (dipakai AGENT LOKAL) ====================
 # Port Chrome remote debugging (Chrome dijalankan dengan flag:
 #   chrome.exe --remote-debugging-port=9222 --user-data-dir="C:\chrome-debug"
 # )
