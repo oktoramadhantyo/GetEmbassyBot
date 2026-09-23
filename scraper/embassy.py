@@ -5,9 +5,14 @@ Alur:
   1. Buka halaman embassy (GLADIUS_URL).
   2. Isi kolom Nomor Internet dengan nomor dari user.
   3. Klik "Cek Kualitas Jaringan".
-  4. Tunggu hasil.
-  5. Klik "Last Five Usage", tunggu isinya selesai dimuat.
-  6. Ambil SATU screenshot full-page berisi hasil + riwayat.
+  4. Baca kolom Paket Radius / Paket PCRF:
+     - sudah berisi -> lanjut ke langkah 6.
+     - kosong (mis. "/") -> ganti dropdown domain ke DAFTAR_DOMAIN
+       (apps.telkom, telkom.net, gold.telkom, telkom.b2b), klik "Cek" lagi,
+       ulangi sampai kolom paket berisi atau semua domain sudah dicoba.
+  5. Jika SEMUA domain kosong -> skip Last Five, tetap foto hasil.
+  6. Jika paket berisi -> klik "Last Five Usage", tunggu isinya selesai dimuat.
+  7. Ambil SATU screenshot full-page berisi hasil + riwayat.
 
 Catatan selector: halaman tidak punya selector resmi yang terdokumentasi, jadi
 elemen dicari toleran via teks (pola BotInsera). Divalidasi saat test langsung.
@@ -19,7 +24,18 @@ from datetime import datetime
 
 from selenium.webdriver.remote.webdriver import WebDriver
 
-from config import GLADIUS_URL, WAIT_HASIL, WAIT_LFU, SCREENSHOT_DIR, TEKS_TOMBOL_CEK, TEKS_TOMBOL_LFU
+from config import (
+    GLADIUS_URL,
+    WAIT_HASIL,
+    WAIT_LFU,
+    SCREENSHOT_DIR,
+    TEKS_TOMBOL_CEK,
+    TEKS_TOMBOL_LFU,
+    DAFTAR_DOMAIN,
+    NILAI_PAKET_KOSONG,
+    TEKS_KOLOM_PAKET,
+    TEKS_KOLOM_PAKET_ALT,
+)
 from scraper import browser
 
 _JS_CARI_TEKS = r"""
@@ -72,6 +88,104 @@ function __cariInput(){
   return best;
 }
 return __cariInput();
+"""
+
+# Pilih opsi pada dropdown domain. Hanya mempertimbangkan <select> yang punya
+# opsi bertanda titik (heuristik: dropdown domain sendirian, bukan dropdown lain)
+# agar tidak menyentuh <select> tidak terkait (mis. paginasi).
+_JS_PILIH_DOMAIN = r"""
+function __pilihDomain(domain){
+  domain = String(domain).toLowerCase().trim();
+  var pat = /\./;
+  var sel = document.querySelectorAll('select');
+  for(var i=0;i<sel.length;i++){
+    var s = sel[i];
+    var ada = false;
+    for(var j=0;j<s.options.length;j++){
+      if(pat.test((s.options[j].text||'')+' '+(s.options[j].value||''))){ ada = true; break; }
+    }
+    if(!ada) continue;
+    for(var k=0;k<s.options.length;k++){
+      var o = s.options[k];
+      var teks = ((o.text||'')+' '+(o.value||'')).replace(/\s+/g,' ').trim().toLowerCase();
+      if(teks.indexOf(domain) >= 0){
+        s.value = o.value;
+        s.dispatchEvent(new Event('change',{bubbles:true}));
+        s.dispatchEvent(new Event('input',{bubbles:true}));
+        return true;
+      }
+    }
+  }
+  return false;
+}
+return __pilihDomain(arguments[0]);
+"""
+
+# Baca label dropdown domain yang sedang terpilih (untuk efisiensi: hindari
+# mengecek ulang domain yang sama). Kosong jika tidak ada <select> domain.
+_JS_BACA_DOMAIN_TERPILIH = r"""
+function __bacaDomain(){
+  var pat = /\./;
+  var sel = document.querySelectorAll('select');
+  for(var i=0;i<sel.length;i++){
+    var s = sel[i];
+    var ada = false;
+    for(var j=0;j<s.options.length;j++){
+      if(pat.test((s.options[j].text||'')+' '+(s.options[j].value||''))){ ada = true; break; }
+    }
+    if(!ada) continue;
+    var so = s[s.selectedIndex];
+    return so ? ((so.text||'')+' '+(so.value||'')).replace(/\s+/g,' ').trim() : '';
+  }
+  return '';
+}
+return __bacaDomain();
+"""
+
+# Baca isi kolom "Paket Radius / Paket PCRF" dari hasil. Mengembalikan teks
+# mentah nilai kolom (kosong bila tidak ketemu / tidak ada nilai).
+_JS_BACA_PAKET = r"""
+function __bacaPaket(kw, alt){
+  function norm(s){ return (s||'').replace(/\s+/g,' ').trim(); }
+  var pat = new RegExp('(?:' + kw.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '|' + alt.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + ')','i');
+  var seen = {};
+  var cells = document.querySelectorAll('td,th,div,span,label,li');
+  for(var i=0;i<cells.length;i++){
+    var el = cells[i];
+    var t = norm(el.innerText||el.textContent||'');
+    if(!t) continue;
+    var m = t.match(pat);
+    if(!m) continue;
+    // Nilai = teks sehabis kata kunci pada elemen itu sendiri
+    var val = t.slice(m.index + m[0].length).replace(/^[\s:=\-]+/,'').trim();
+    // Prioritas: sel/saudara berikutnya pada baris tabel
+    var row = el.closest('tr');
+    if(row){
+      var cs = row.querySelectorAll('td,th');
+      for(var k=0;k<cs.length;k++){
+        if(cs[k]===el && k+1<cs.length){
+          var v2 = norm(cs[k+1].innerText||cs[k+1].textContent||'');
+          if(v2 && v2.length<=60 && !seen[v2]){ seen[v2]=1; return v2; }
+        }
+      }
+    }
+    // Lalu: teks induk sehabis kata kunci
+    var par = el.parentElement;
+    if(par && par!==el){
+      var pt = norm(par.innerText||par.textContent||'');
+      if(pt.length>t.length){
+        var pm = pt.match(pat);
+        if(pm){
+          var pv = pt.slice(pm.index+pm[0].length).replace(/^[\s:=\-]+/,'').trim();
+          if(pv && pv.length<=60 && !seen[pv]){ seen[pv]=1; return pv; }
+        }
+      }
+    }
+    if(val && val.length<=60 && !seen[val]){ seen[val]=1; return val; }
+  }
+  return '';
+}
+return __bacaPaket(arguments[0], arguments[1]);
 """
 
 
@@ -148,6 +262,36 @@ def _isi_nomor(driver: WebDriver, nomor: str) -> bool:
     return True
 
 
+def _isi_dropdown(driver: WebDriver, domain: str) -> bool:
+    """Set dropdown domain ke 'domain'. Pakai <select> native bila ada;
+    fallback klik teks untuk dropdown custom."""
+    if driver.execute_script(_JS_PILIH_DOMAIN, domain):
+        time.sleep(0.4)
+        return True
+    return _klik_teks(driver, domain)
+
+
+def _baca_domain_terpilih(driver: WebDriver) -> str:
+    """Label dropdown domain yang sedang aktif (untuk efisiensi)."""
+    try:
+        return str(driver.execute_script(_JS_BACA_DOMAIN_TERPILIH) or "").strip()
+    except Exception:
+        return ""
+
+
+def _baca_paket_radius(driver: WebDriver) -> str:
+    """Nilai mentah kolom Paket Radius / Paket PCRF pada hasil Cek."""
+    try:
+        raw = driver.execute_script(_JS_BACA_PAKET, TEKS_KOLOM_PAKET, TEKS_KOLOM_PAKET_ALT)
+        return " ".join(str(raw or "").split())
+    except Exception:
+        return ""
+
+
+def _paket_kosong(nilai: str) -> bool:
+    return nilai.strip().lower() in NILAI_PAKET_KOSONG
+
+
 def _buka_tab_gladius(driver: WebDriver) -> bool:
     """Pakai tab Gladius yang sudah terbuka, atau buka tab baru ke GLADIUS_URL."""
     for handle in driver.window_handles:
@@ -195,7 +339,14 @@ def cek_embassy(driver: WebDriver, nomor: str) -> dict:
     """Menjalankan satu siklus cek embassy dan menghasilkan 1 screenshot.
 
     Selalu mengembalikan dict dengan field:
-      nomor, waktu, screenshot (Path), hasil_ok (bool), lfu_ok (bool)
+      nomor, waktu, screenshot (Path), hasil_ok (bool), lfu_ok (bool),
+      paket_ok (bool), domain_terpakai (str|None)
+
+    Alur dropdown domain:
+      - cek dulu dgn dropdown apa adanya;
+      - jika kolom Paket kosong -> ganti-ganti DAFTAR_DOMAIN sambil klik "Cek"
+        sampai paket berisi (atau semua domain habis dicoba);
+      - Last Five Usage DIPANGGIL hanya ketika paket sudah berisi.
     """
     import pathlib
 
@@ -205,6 +356,8 @@ def cek_embassy(driver: WebDriver, nomor: str) -> dict:
         "screenshot": None,
         "hasil_ok": False,
         "lfu_ok": False,
+        "paket_ok": False,
+        "domain_terpakai": None,
     }
 
     _buka_tab_gladius(driver)
@@ -213,14 +366,42 @@ def cek_embassy(driver: WebDriver, nomor: str) -> dict:
     if not _isi_nomor(driver, nomor):
         raise LookupError("Kolom input Nomor Internet tidak ditemukan di halaman embassy.")
 
+    # 1) Cek dengan dropdown apa adanya (tanpa ganti-ganti).
     if not _klik_teks(driver, TEKS_TOMBOL_CEK, needs_include=True):
         raise LookupError(f"Tombol '{TEKS_TOMBOL_CEK}' tidak ditemukan.")
-
-    # Tunggu hasil muncul (page settle)
     _tunggu_tenang(driver, WAIT_HASIL)
-    hasil["hasil_ok"] = _cari_teks(driver, TEKS_TOMBOL_LFU, needs_include=True) is not None
 
-    if hasil["hasil_ok"]:
+    paket = _baca_paket_radius(driver)
+    if not _paket_kosong(paket):
+        hasil["paket_ok"] = True
+        hasil["domain_terpakai"] = _baca_domain_terpilih(driver) or None
+    else:
+        # 2) Kolom kosong -> loop DAFTAR_DOMAIN sampai berisi / habis.
+        dicoba = set()
+        terpilih = _baca_domain_terpilih(driver).lower()
+        if terpilih:
+            for d in DAFTAR_DOMAIN:
+                if d.lower() in terpilih:
+                    dicoba.add(d.lower())
+        for domain in DAFTAR_DOMAIN:
+            if domain.lower() in dicoba:
+                continue
+            dicoba.add(domain.lower())
+            if not _isi_dropdown(driver, domain):
+                continue
+            if not _klik_teks(driver, TEKS_TOMBOL_CEK, needs_include=True):
+                continue
+            _tunggu_tenang(driver, WAIT_HASIL)
+            paket = _baca_paket_radius(driver)
+            if not _paket_kosong(paket):
+                hasil["paket_ok"] = True
+                hasil["domain_terpakai"] = domain
+                break
+
+    hasil["hasil_ok"] = hasil["paket_ok"]
+
+    # 3) Last Five Usage DIPANGGIL hanya jika kolom paket sudah berisi.
+    if hasil["paket_ok"]:
         if _klik_teks(driver, TEKS_TOMBOL_LFU, needs_include=True):
             _tunggu_tenang(driver, WAIT_LFU)
             hasil["lfu_ok"] = True
@@ -252,7 +433,10 @@ def _main_cli() -> int:
             print("--- PAGE TEXT ---")
             print(driver.execute_script("return document.body ? document.body.innerText : ''"))
         print(f"Screenshot: {hasil['screenshot']}")
-        print(f"hasil_ok={hasil['hasil_ok']} lfu_ok={hasil['lfu_ok']}")
+        print(
+            f"hasil_ok={hasil['hasil_ok']} lfu_ok={hasil['lfu_ok']} "
+            f"paket_ok={hasil['paket_ok']} domain_terpakai={hasil['domain_terpakai']}"
+        )
     finally:
         browser.tutup(driver)
     return 0

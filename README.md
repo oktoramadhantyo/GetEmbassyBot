@@ -123,9 +123,22 @@ Isi: `TELEGRAM_BOT_TOKEN`, `RAILWAY_URL`, `AGENT_SECRET`.
 python -m scraper.embassy 121519246796 --dump
 ```
 
+## Alur Dropdown Domain (Paket Radius / PCRF)
+
+1. Saat pertama **Cek Kualitas Jaringan** dgn dropdown apa adanya.
+2. Baca kolom **Paket Radius / Paket PCRF** pada tabel hasil:
+   - **sudah berisi** → lanjut ke "Last Five Usage";
+   - **kosong** (mis. `/`, `-`) → ganti dropdown domain ke `DAFTAR_DOMAIN`
+     (default `apps.telkom`, `telkom.net`, `gold.telkom`, `telkom.b2b`),
+     klik **Cek Kualitas Jaringan** lagi → ulangi sampai kolom paket berisi
+     atau semua domain sudah dicoba.
+3. **Last Five Usage** dipanggil **hanya** jika kolom paket sudah berisi.
+4. Jika SEMUA domain kosong → tetap kirim screenshot Embassy + catatan
+   "Paket Radius/PCRF tidak ditemukan dalam N domain."
+
 ## Catatan Selector
 
-Selector halaman Gladius belum terdokumentasi; elemen dicari toleran berdasarkan teks ("Cek Kualitas Jaringan", "Last Five Usage") dan field input Nomor Internet. Divalidasi saat test langsung — jika tombol tidak ketemu, hasil dump di atas membantu menyesuaikan.
+Selector halaman Gladius belum terdokumentasi; elemen dicari toleran berdasarkan teks ("Cek Kualitas Jaringan", "Last Five Usage"), input Nomor Internet, `<select>` dropdown domain (heuristik opsi bertanda titik), dan kolom paket ("paket radius"/"paket pcrf"). Divalidasi saat test langsung — jika tidak cocok, hasil dump di atas membantu menyesuaikan.
 
 ## Progress / Checklist
 

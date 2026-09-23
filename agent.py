@@ -133,7 +133,12 @@ def proses(task: dict) -> None:
         browser.tutup(driver)
 
     caption = f"Embassy {hasil['nomor']} | {hasil['waktu']}"
-    if not hasil.get("lfu_ok"):
+    if not hasil.get("paket_ok"):
+        caption += (
+            f"\nPaket Radius/PCRF tidak ditemukan dalam "
+            f"{len(config.DAFTAR_DOMAIN)} domain."
+        )
+    elif not hasil.get("lfu_ok"):
         caption += (
             "\nLast Five Usage gagal atau tidak selesai dimuat. "
             "Gambar berikut adalah hasil Embassy sebelum percobaan riwayat."

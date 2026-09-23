@@ -60,3 +60,22 @@ SCREENSHOT_DIR = pathlib.Path(os.getenv("SCREENSHOT_DIR", "outputs"))
 # disesuaikan saat validasi di halaman nyata.
 TEKS_TOMBOL_CEK = "Cek Kualitas Jaringan"
 TEKS_TOMBOL_LFU = "Last Five Usage"
+
+# ==================== DROPDOWN DOMAIN & KOLOM PAKET ====================
+# Domain yang dicoba berurutan sampai kolom "Paket Radius / Paket PCRF" berisi.
+# Catatan: coba dulu dropdown apa adanya; baru loop daftar ini jika masih kosong.
+DAFTAR_DOMAIN = [
+    d.strip()
+    for d in os.getenv(
+        "DAFTAR_DOMAIN",
+        "apps.telkom,telkom.net,gold.telkom,telkom.b2b",
+    ).split(",")
+    if d.strip()
+]
+
+# Kolom paket dianggap KOSONG bila isinya salah satu nilai di bawah ini.
+NILAI_PAKET_KOSONG = {"/", "-", "", "0", "n/a", "na", "kosong", "null", "none"}
+
+# Kata kunci teks kolom paket pada tabel hasil (dicari toleran).
+TEKS_KOLOM_PAKET = os.getenv("TEKS_KOLOM_PAKET", "paket radius")
+TEKS_KOLOM_PAKET_ALT = "paket pcrf"
