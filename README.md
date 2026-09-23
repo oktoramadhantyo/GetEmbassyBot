@@ -53,6 +53,7 @@ Projek Magang-GetEmbassy/
 ├── .env.example         # template .env
 ├── .env                 # (gitignored) token & setting
 ├── Procfile             # web: python bot.py
+├── start_agent.bat      # (laptop PIC) doibel-klik: Chrome debug + jalankan agent
 ├── Screenshot 2026-09-22 125002.png
 └── outputs/             # hasil screenshot (gitignored)
 ```
@@ -96,6 +97,10 @@ Isi: `TELEGRAM_BOT_TOKEN`, `RAILWAY_URL`, `AGENT_SECRET`.
 > Catatan: `PORT` di-inject otomatis oleh Railway; batas `WAIT_ANNOUNCE_MENIT` untuk announce "tidak tersambung".
 
 ### 4. Jalankan agent lokal (laptop PIC)
+
+**Cara termudah: doibel-klik `start_agent.bat`** (auto-detect `chrome.exe`, buka Chrome debug dengan profil terpisah `chrome-profile`, lalu jalankan `python agent.py`).
+
+**Atau manual:**
 
 1. Buka Chrome dengan remote debugging:
 
