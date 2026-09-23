@@ -112,7 +112,9 @@ def _klik_teks(driver: WebDriver, teks: str, needs_include: bool = False) -> boo
     if el is None:
         return False
     try:
-        driver.execute_script("arguments[0].scrollIntoView(true);", el)
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center', inline:'center'});", el
+        )
         time.sleep(0.3)
         el.click()
         return True
@@ -120,7 +122,9 @@ def _klik_teks(driver: WebDriver, teks: str, needs_include: bool = False) -> boo
         # Fallback: klik via JS
         try:
             driver.execute_script(
-                "arguments[0].scrollIntoView(true); arguments[0].click();", el
+                "arguments[0].scrollIntoView({block:'center', inline:'center'}); "
+                "arguments[0].click();",
+                el,
             )
             return True
         except Exception:
@@ -131,8 +135,14 @@ def _isi_nomor(driver: WebDriver, nomor: str) -> bool:
     el = driver.execute_script(_JS_CARI_INPUT)
     if el is None:
         return False
-    driver.execute_script("arguments[0].scrollIntoView(true);", el)
-    el.click()
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block:'center', inline:'center'});", el
+    )
+    time.sleep(0.3)
+    try:
+        el.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", el)
     el.clear()
     el.send_keys(nomor)
     return True
