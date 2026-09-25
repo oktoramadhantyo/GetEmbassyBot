@@ -163,6 +163,8 @@ def main() -> None:
         try:
             items = ambil_antrian()
             for task in items:
+                if task.get("jenis", "embassy") != "embassy":
+                    continue
                 try:
                     proses(task)
                 except Exception as exc:

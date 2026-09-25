@@ -1,14 +1,14 @@
 # Projek Magang - GetEmbassy
 
-Bot Telegram untuk memeriksa nomor Embassy di Web Gladius dan mengirim 1 screenshot hasilnya ke user Telegram.
+Bot Telegram untuk memeriksa nomor Embassy atau Password Check di Web Gladius dan mengirim 1 screenshot hasilnya ke user Telegram.
 
-Arsitektur: **bot di Railway (online 24 jam) + UserScript Tampermonkey di browser laptop PIC** (yang memegang session login Gladius). Tidak perlu Python lokal / Selenium / Chrome debug port. UserScript menanya antrian ke Railway via HTTP, memproses cek embassy langsung di dalam halaman Gladius, lalu mengirim screenshot (html2canvas) kembali ke Railway untuk dikirim ke user.
+Arsitektur: **bot di Railway (online 24 jam) + UserScript Tampermonkey di browser laptop PIC** (yang memegang session login Gladius). Tidak perlu Python lokal / Selenium / Chrome debug port. UserScript menanya antrian ke Railway via HTTP, memproses Embassy atau Password Check langsung di dalam halaman Gladius, lalu mengirim screenshot (html2canvas) kembali ke Railway untuk dikirim ke user.
 
 ## Arsitektur
 
 ```
 [User Telegram]
-     │  /embassy 121519246796
+     │  /embassy 121519246796 atau /password 121519246796
      ▼
 [RAILWAY: bot.py]  (PTB polling + HTTP endpoint mini)
      │  catat antrian di RAM          ▲──── daemon 24 jam
@@ -17,8 +17,8 @@ Arsitektur: **bot di Railway (online 24 jam) + UserScript Tampermonkey di browse
                                 ▼       │
 [Chrome PIC: gladius-embassy.user.js] (tiap 10 dtk, Tampermonkey)
      │  halaman Gladius sudah login
-     │  → isi nomor → Cek Kualitas Jaringan → loop domain
-     │    sampai Paket Radius/PCRF berisi → Last Five Usage
+     │  → isi nomor → Cek Kualitas Jaringan / Password Check
+     │    → proses sesuai jenis → screenshot
      │  → screenshot html2canvas → base64
      ├── POST /kirim?secret=... (foto + caption → Railway kirim ke user)
      └── POST /selesai?secret=... (laporan gagal jika perlu)
@@ -39,6 +39,7 @@ Silakan dicoba lagi nanti.
 | Perintah | Fungsi |
 |---|---|
 | `/embassy <nomor>` | Cek kualitas jaringan embassy & kirim 1 screenshot |
+| `/password <nomor>` | Cek status password & kirim 1 screenshot |
 | `/status` | Status bot / indikasi agent aktif |
 | `/start`, `/help` | Bantuan |
 
@@ -50,7 +51,7 @@ Projek Magang-GetEmbassy/
 ├── bot.py                    # sisi RAILWAY: PTB polling + antrian + HTTP /antrian /kirim /selesai /health
 ├── agent.py                  # (LAMA, opsional) agent Selenium lokal
 ├── config.py                 # konfigurasi pusat via .env
-├── gladius-embassy.user.js   # (BARU) UserScript Tampermonkey di Chrome PIC — jalankan proses cek embassy
+├── gladius-embassy.user.js   # UserScript Tampermonkey di Chrome PIC — proses Embassy/Password Check
 ├── scraper/
 │   ├── browser.py            # (dipakai agent.py lama) cek debug port + attach Chrome login existing
 │   └── embassy.py            # logika cek embassy (sumber JS selector + test CLI --dump)
@@ -109,9 +110,8 @@ Isi: `TELEGRAM_BOT_TOKEN`, `RAILWAY_URL`, `AGENT_SECRET`.
    - `RAILWAY_URL` = URL bot di Railway.
    - `AGENT_SECRET` = sama persis dengan value di Railway/`.env`.
    - `SS_CROP = "auto"` = screenshot di-crop ke area hasil ukur saja (sidebar/logo Gladius + tabel hasil + Last Five Usage), `SS_SCALE` = tingkat kecil/besar (default `1`). Kalau auto-crop kurang pas, isi `SS_CROP_OVERRIDE` mis. `{left: 0, top: 0, right: 1400, bottom: 2100}` untuk angka pasti.
-4. Buka halaman embassy Gladius → **login** → biarkan tab ini selalu terbuka:
-   `https://gladius.telkom.co.id/radonline/newradonline`
-5. Pastikan badge **🟢 GetEmbassy: idle** muncul di bawah kanan. Klik tombol `⏸ Auto: ON` untuk mati/nyalakan (mudah dicek).
+4. Buka halaman Gladius → **login** → biarkan tab ini selalu terbuka. Bot dapat membuka halaman Embassy atau Password Check sesuai permintaan.
+5. Pastikan badge **🟢 GetEmbassy: idle** muncul di bawah kanan. Klik tombol `ON`/`OFF` untuk menyalakan atau mematikan.
 
 > Satu user/PIC harus menjaga tab Chrome ini tetap menyala + login agar robot bisa dipakai. Tidak perlu Python/Selenium/debug port lagi. Jika tab mati, bot otomatis menginfokan "Server Gladius tidak tersambung".
 >
@@ -138,19 +138,19 @@ python -m scraper.embassy 121519246796 --dump
 
 ## Catatan Selector
 
-Selector halaman Gladius belum terdokumentasi; elemen dicari toleran berdasarkan teks ("Cek Kualitas Jaringan", "Last Five Usage"), input Nomor Internet, `<select>` dropdown domain (heuristik opsi bertanda titik), dan kolom paket ("paket radius"/"paket pcrf"). Divalidasi saat test langsung — jika tidak cocok, hasil dump di atas membantu menyesuaikan.
+Selector halaman Gladius belum terdokumentasi; elemen dicari toleran berdasarkan teks ("Cek Kualitas Jaringan", "Password Check", "Last Five Usage"), input Nomor Internet, navigasi menu, `<select>` dropdown domain (heuristik opsi bertanda titik), dan kolom paket/status. Divalidasi saat test langsung — jika tidak cocok, hasil dump di atas membantu menyesuaikan.
 
 ## Progress / Checklist
 
 - [x] Deskripsi alur bot & pesan output
 - [x] Konfirmasi URL + cara masuk Web Gladius
-- [x] Handler `/embassy <nomor>`
+- [x] Handler `/embassy <nomor>` dan `/password <nomor>`
 - [x] Announcement "Server Gladius tidak tersambung" + `/status`
 - [x] Arsitektur Railway + agent (awalnya agent lokal, lihat bawah)
 - [x] Scraper pencarian nomor embassy di Web Gladius
-- [x] Screenshot hasil Embassy + Last Five Usage (1 gambar)
+- [x] Screenshot hasil Embassy/Password Check (1 gambar; nilai password dimasker)
 - [x] Penanganan gagal riwayat → tetap kirim screenshot Embassy
 - [x] UserScript Tampermonkey `gladius-embassy.user.js` (ganti agent Python-lokal: polling `/antrian`, proses di halaman, html2canvas screenshot, kirim ke `/kirim`)
 - [x] Railway endpoint `/kirim` (relay foto base64 → sendPhoto + edit pesan) & `/selesai` (edit pesan gagal)
-- [ ] Test end-to-end via Telegram: pasang userscript di Chrome PIC, kirim `/embassy <nomor>`, validasi selector/posisi screenshot (html2canvas — ingat risiko iframe)
+- [ ] Test end-to-end via Telegram: pasang userscript di Chrome PIC, kirim `/embassy <nomor>` atau `/password <nomor>`, validasi navigasi/selector/screenshot (html2canvas — ingat risiko iframe)
 - [ ] Deploy Railway versi baru (dengan `/kirim`) + jalankan browser PIC dengan userscript aktif

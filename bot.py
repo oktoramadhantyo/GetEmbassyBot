@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Bot Telegram GetEmbassy (sisi Railway).
 
-Menerima perintah dari user, mencatat permintaan cek embassy ke antrian
-in-memory, lalu menyediakan endpoint HTTP publik yang ditanya-tanya oleh
-agent lokal (laptop PIC) yang memegang Chrome + Gladius.
+Menerima perintah dari user, mencatat permintaan cek Embassy atau Password
+Check ke antrian in-memory, lalu menyediakan endpoint HTTP publik yang
+ditanya-tanya oleh runner lokal (laptop PIC) yang memegang Chrome + Gladius.
 
 Alur:
   /embassy <nomor>  -> tulis antrian + balas "Embassy: mengukur ..."
@@ -51,19 +51,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== ANTRIAN (in-memory) ====================
-# task_id -> {"nomor", "chat_id", "message_id", "waktu", "status", "pesan"}
+# task_id -> {"nomor", "jenis", "chat_id", "message_id", "waktu", "status", "pesan"}
 _antrian: dict[str, dict] = {}
 _antrian_lock = threading.Lock()
 _id_counter = 0
 
 
-def _tambah_task(nomor: str, chat_id: int, message_id: int) -> str:
+def _tambah_task(
+    nomor: str, chat_id: int, message_id: int, jenis: str = "embassy"
+) -> str:
     global _id_counter
     with _antrian_lock:
         _id_counter += 1
         task_id = f"T-{_id_counter}"
         _antrian[task_id] = {
             "nomor": nomor,
+            "jenis": jenis,
             "chat_id": chat_id,
             "message_id": message_id,
             "waktu": datetime.now().isoformat(timespec="seconds"),
@@ -84,6 +87,7 @@ def _ambil_pending() -> list[dict]:
             {
                 "id": i,
                 "nomor": t["nomor"],
+                "jenis": t.get("jenis", "embassy"),
                 "chat_id": t["chat_id"],
                 "message_id": t["message_id"],
             }
@@ -104,19 +108,20 @@ def _ringkasan_status() -> str:
         if not _antrian:
             return (
                 "Bot online ✓\n"
-                "Belum ada permintaan /embassy terakhir.\n"
-                "Kirim /embassy <nomor> lalu lihat apakah ada balasan hasil."
+                "Belum ada permintaan terakhir.\n"
+                "Kirim /embassy <nomor> atau /password <nomor> lalu lihat hasilnya."
             )
         terakhir = max(_antrian.values(), key=lambda t: t["waktu"])
         st = terakhir["status"]
         jam = terakhir["waktu"].replace("T", " ")[:19]
+        nama = "Password Check" if terakhir.get("jenis") == "password" else "Embassy"
         if st == "pending":
             kondisi = "permintaan terakhir masih menunggu agent (agent/Gladius belum merespons)."
         elif st == "selesai":
             kondisi = "agent aktif ✓ (permintaan terakhir selesai diproses)."
         else:
             kondisi = "agent tidak terdeteksi pada permintaan terakhir."
-        return f"Bot online ✓\n{kondisi}\nTerakhir: {jam} ({st})"
+        return f"Bot online ✓\n{kondisi}\n{nama} terakhir: {jam} ({st})"
 
 
 # ==================== TELEGRAM API (relay foto dari userscript) ====================
@@ -150,6 +155,14 @@ def _caption_hasil(nomor: str, waktu: str, paket_ok: bool, lfu_ok: bool) -> str:
             "Gambar berikut adalah hasil Embassy sebelum percobaan riwayat."
         )
     return caption
+
+
+def _caption_password(nomor: str, waktu: str, status: str) -> str:
+    caption = f"Password Check {nomor} | {waktu}"
+    status = str(status or "").strip()
+    if status:
+        caption += f"\nStatus: {status}"
+    return caption[:1024]
 
 
 # ==================== HTTP ENDPOINT (dipanggil userscript Tampermonkey) ====================
@@ -204,13 +217,15 @@ class _Handler(BaseHTTPRequestHandler):
                     chat_id = data.get("chat_id")
                     message_id = data.get("message_id")
                     nomor = str(data.get("nomor", ""))
+                    jenis = str(data.get("jenis", "embassy")).lower()
+                    nama = "Password Check" if jenis == "password" else "Embassy"
                     if chat_id is not None and message_id is not None:
                         _tele_post(
                             "editMessageText",
                             data={
                                 "chat_id": chat_id,
                                 "message_id": message_id,
-                                "text": f"Gagal memeriksa Embassy {nomor}:\n{pesan}"[:1024],
+                                "text": f"Gagal memeriksa {nama} {nomor}:\n{pesan}"[:1024],
                             },
                         )
             self._kirim(200, {"ok": True})
@@ -226,10 +241,17 @@ class _Handler(BaseHTTPRequestHandler):
         chat_id = data.get("chat_id")
         message_id = data.get("message_id")
         nomor = str(data.get("nomor", ""))
+        jenis = str(data.get("jenis", "embassy")).lower()
+        status = str(data.get("status", ""))
         foto_b64 = data.get("foto", "")
         paket_ok = bool(data.get("paket_ok"))
         lfu_ok = bool(data.get("lfu_ok"))
-        waktu = str(data.get("waktu", ""))
+        task = _ambil_task(tid)
+        waktu = str(
+            data.get("waktu")
+            or (task or {}).get("waktu")
+            or datetime.now().isoformat(timespec="seconds")
+        )
 
         if not (tid and chat_id is not None and message_id is not None and foto_b64):
             self._kirim(200, {"ok": False, "error": "payload tidak lengkap"})
@@ -241,7 +263,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._kirim(200, {"ok": False, "error": "base64 foto tidak valid"})
             return
 
-        caption = _caption_hasil(nomor, waktu, paket_ok, lfu_ok)
+        if jenis == "password":
+            caption = _caption_password(nomor, waktu, status)
+        else:
+            caption = _caption_hasil(nomor, waktu, paket_ok, lfu_ok)
         terkirim = _tele_post(
             "sendPhoto",
             files={"photo": io.BytesIO(foto_bytes)},
@@ -281,10 +306,12 @@ BANTUAN_TEXT = (
     "GetEmbassy Bot\n\n"
     "Cara pakai:\n"
     "/embassy <nomor>  cek kualitas jaringan embassy & kirim hasil (1 screenshot)\n"
+    "/password <nomor> cek status password & kirim hasil (1 screenshot)\n"
     "/status           cek status bot / agent\n"
     "/start /help      bantuan ini\n\n"
     "Contoh:\n"
-    "/embassy 121519246796"
+    "/embassy 121519246796\n"
+    "/password 121519246796"
 )
 
 PESAN_TIDAK_TERSAMBUNG = (
@@ -304,7 +331,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(_ringkasan_status())
 
 
-async def cmd_embassy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _proses_perintah(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    jenis: str,
+    nama: str,
+    aksi: str,
+    contoh: str,
+):
     msg = update.message
     if not msg:
         return
@@ -313,16 +347,44 @@ async def cmd_embassy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nomor = re.sub(r"\D", "", args[1]) if len(args) > 1 else ""
     if len(nomor) < 5:
         await msg.reply_text(
-            "Gunakan: /embassy <nomor>\nContoh:\n/embassy 121519246796"
+            f"Gunakan: /{jenis} <nomor>\nContoh:\n{contoh}"
         )
         return
 
-    status_msg = await msg.reply_text(f"Embassy: mengukur {nomor}")
-    task_id = _tambah_task(nomor, msg.chat_id, status_msg.message_id)
-    logger.info("Antrian %s: nomor %s dari chat %s", task_id, nomor, msg.chat_id)
+    status_msg = await msg.reply_text(f"{nama}: {aksi} {nomor}")
+    task_id = _tambah_task(nomor, msg.chat_id, status_msg.message_id, jenis)
+    logger.info(
+        "Antrian %s: %s nomor %s dari chat %s",
+        task_id,
+        jenis,
+        nomor,
+        msg.chat_id,
+    )
 
     context.application.create_task(
         _pantau_timeout(context.application, task_id, nomor)
+    )
+
+
+async def cmd_embassy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _proses_perintah(
+        update,
+        context,
+        "embassy",
+        "Embassy",
+        "mengukur",
+        "/embassy 121519246796",
+    )
+
+
+async def cmd_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _proses_perintah(
+        update,
+        context,
+        "password",
+        "Password Check",
+        "memeriksa",
+        "/password 121519246796",
     )
 
 
@@ -350,6 +412,7 @@ def main() -> None:
     app.add_handler(CommandHandler(["start", "help"], cmd_bantuan))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("embassy", cmd_embassy))
+    app.add_handler(CommandHandler("password", cmd_password))
     logger.info("Bot GetEmbassy jalan - poll status...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

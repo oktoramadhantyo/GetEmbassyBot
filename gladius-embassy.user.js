@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GetEmbassy Gladius - Proses Otomatis
 // @namespace    http://tampermonkey.net/
-// @version      1.3.1
-// @description  [GetEmbassy] Auto-proses antrian /embassy dari bot Railway langsung di halaman Gladius: isi Nomor Internet, Cek Kualitas Jaringan, loop dropdown domain sampai Paket Radius/PCRF berisi, Last Five Usage, screenshot (html2canvas), lalu kirim base64 ke Railway. Tanpa Python/Selenium/debug port.
+// @version      1.4.0
+// @description  [GetEmbassy] Auto-proses antrian /embassy dan /password dari bot Railway langsung di halaman Gladius: isi Nomor Internet, proses Embassy atau Password Check, ambil screenshot (html2canvas), lalu kirim base64 ke Railway. Tanpa Python/Selenium/debug port.
 // @author       diana
 // @match        https://gladius.telkom.co.id/*
 // @grant        GM_xmlhttpRequest
@@ -24,6 +24,7 @@
   var SS_CROP = "auto"; // "auto" = area hasil ukur (sidebar+logo+tabel hasil+LFU) | "none" = full page
   var SS_CROP_PAD = 16; // ruang ekstra di sekeliling area hasil (px)
   var SS_CROP_OVERRIDE = null; // kalau auto meleset: isi {left, top, right, bottom}
+  var SS_MASK_PASSWORD = true;
 
   var DAFTAR_DOMAIN = ["apps.telkom", "telkom.net", "gold.telkom", "telkom.b2b"];
   var NILAI_PAKET_KOSONG = ["/", "-", "", "0", "n/a", "na", "kosong", "null", "none"];
@@ -31,6 +32,13 @@
   var TEKS_KOLOM_PAKET_ALT = "paket pcrf";
   var TEKS_TOMBOL_CEK = "Cek Kualitas Jaringan";
   var TEKS_TOMBOL_LFU = "Last Five Usage";
+  var TEKS_TOMBOL_PASSWORD = "Check";
+  var URL_EMBASSY = "https://gladius.telkom.co.id/radonline/newradonline";
+  var URL_PASSWORD = "https://gladius.telkom.co.id/internetnumberr/passwordchecknew";
+  var MENU_EMBASSY = ["Embassy", "Pengukuran via Rest API"];
+  var MENU_PASSWORD = ["Internet Number Check", "Password Check"];
+  var NAV_TIMEOUT_MS = 10000;
+  var WAIT_PASSWORD_MS = 15000;
   // ====================================================================================
 
   // ===================== STATE TOLERAN RELOAD (sessionStorage) =====================
@@ -58,6 +66,7 @@
       var st = JSON.parse(raw);
       if (!st || !st.id) return null;
       if (Date.now() - st.ts > STATE_TTL_MS) { hapusState(); return null; }
+      if (!st.jenis) st.jenis = "embassy";
       return st;
     } catch (e) { return null; }
   }
@@ -339,6 +348,120 @@
     });
   }
 
+  function teksEl(el) {
+    return String((el && (el.innerText || el.textContent || el.value)) || "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function cariMenu(teks) {
+    teks = String(teks || "").toLowerCase().replace(/\s+/g, " ").trim();
+    if (!teks) return null;
+    var root = document.querySelector("#sidebar, .sidebar-wrapper, aside");
+    var scope = root ? [root] : [document];
+    var best = null;
+    var bestSkor = -1;
+    for (var s = 0; s < scope.length; s++) {
+      var els = scope[s].querySelectorAll("a, button, li, span, div");
+      for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        if (el.offsetParent === null) continue;
+        var t = teksEl(el).toLowerCase();
+        if (t !== teks && t.indexOf(teks) < 0) continue;
+        if (t.length > teks.length * 4) continue;
+        var skor = 0;
+        var tag = el.tagName.toLowerCase();
+        if (tag === "a" || tag === "button") skor += 100;
+        if (tag === "li") skor += 40;
+        if (t === teks) skor += 50;
+        if (teksEl(el).length <= 60) skor += 10;
+        if (skor > bestSkor) { bestSkor = skor; best = el; }
+      }
+      if (best) return best;
+    }
+    return cariTeks(teks, true);
+  }
+
+  function tungguMenu(teks, maxMs) {
+    return new Promise(function (resolve) {
+      var mulai = Date.now();
+      (function poll() {
+        var el = cariMenu(teks);
+        if (el) { resolve(el); return; }
+        if (Date.now() - mulai >= (maxMs || 5000)) {
+          resolve(null);
+          return;
+        }
+        setTimeout(poll, 200);
+      })();
+    });
+  }
+
+  function pathSekarang() {
+    return location.pathname.replace(/\/+$/, "") || "/";
+  }
+
+  function pathTarget(jenis) {
+    return jenis === "password"
+      ? "/internetnumberr/passwordchecknew"
+      : "/radonline/newradonline";
+  }
+
+  function targetURL(jenis) {
+    return jenis === "password" ? URL_PASSWORD : URL_EMBASSY;
+  }
+
+  function diHalamanTarget(jenis) {
+    return pathSekarang() === pathTarget(jenis);
+  }
+
+  function tungguPath(jenis, maxMs) {
+    return new Promise(function (resolve) {
+      var mulai = Date.now();
+      (function poll() {
+        if (diHalamanTarget(jenis)) { resolve(true); return; }
+        if (Date.now() - mulai >= (maxMs || NAV_TIMEOUT_MS)) {
+          resolve(false);
+          return;
+        }
+        setTimeout(poll, 200);
+      })();
+    });
+  }
+
+  async function bukaHalaman(jenis) {
+    if (diHalamanTarget(jenis)) return "ready";
+    var labels = jenis === "password" ? MENU_PASSWORD : MENU_EMBASSY;
+    setStatus("🔎 Membuka halaman " + (jenis === "password" ? "Password Check" : "Embassy") + " ...");
+    var parent = await tungguMenu(labels[0], 3000);
+    if (parent) {
+      try { parent.click(); } catch (e) {}
+      await tungguTenang(500);
+    }
+    var child = await tungguMenu(labels[1], 5000);
+    if (child) {
+      try { child.click(); } catch (e) {}
+      await tungguPath(jenis, 5000);
+    }
+    if (diHalamanTarget(jenis)) return "ready";
+    try { location.assign(targetURL(jenis)); } catch (e) {}
+    return "navigating";
+  }
+
+  async function tungguFormTugas(jenis) {
+    var mulai = Date.now();
+    var maks = jenis === "password" ? WAIT_PASSWORD_MS : WAIT_HASIL_MS;
+    while (Date.now() - mulai < maks) {
+      var input = cariInput();
+      var tombol = jenis === "password"
+        ? (cariTeks(TEKS_TOMBOL_PASSWORD, true) || cariTeks("Cek", true))
+        : cariTeks(TEKS_TOMBOL_CEK, true);
+      if (input && tombol) return true;
+      await wait(500);
+    }
+    return false;
+  }
+
   // ===================== PROSES 1 NOMOR (alur embassy.py, toleran reload) =====================
 
   // Domain berikut yang BELUM dicoba (menghindari domain sama berulang saat resume).
@@ -404,6 +527,146 @@
     return lanjutDariCek(st);
   }
 
+  function cariElemenStatusPassword() {
+    var labels = ["status password", "password status", "status pelanggan", "status"];
+    var nodes = document.querySelectorAll("td, th, label, span, div");
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (el.offsetParent === null) continue;
+      var t = teksEl(el).toLowerCase();
+      if (!t || t.length > 300) continue;
+      for (var j = 0; j < labels.length; j++) {
+        if (t === labels[j] || t.indexOf(labels[j] + " ") >= 0 || t.indexOf(labels[j] + ":") >= 0) {
+          return el;
+        }
+      }
+    }
+    return null;
+  }
+
+  function bacaStatusPassword() {
+    var labels = ["status password", "password status", "status pelanggan", "status"];
+    var tables = document.querySelectorAll("table");
+    for (var ti = 0; ti < tables.length; ti++) {
+      var trs = tables[ti].querySelectorAll("tr");
+      for (var hi = 0; hi < trs.length; hi++) {
+        var headers = trs[hi].querySelectorAll("th, td");
+        for (var h = 0; h < headers.length; h++) {
+          var headerText = teksEl(headers[h]).toLowerCase();
+          var isStatus = false;
+          for (var li = 0; li < labels.length; li++) {
+            if (headerText === labels[li] || headerText.indexOf(labels[li] + " ") >= 0) {
+              isStatus = true;
+              break;
+            }
+          }
+          if (!isStatus) continue;
+          for (var ri = hi + 1; ri < trs.length; ri++) {
+            var dataCells = trs[ri].querySelectorAll("td");
+            var statusValue = dataCells[h] ? teksEl(dataCells[h]) : "";
+            if (statusValue) return statusValue.slice(0, 200);
+          }
+        }
+      }
+    }
+    var el = cariElemenStatusPassword();
+    if (!el) return "Status tidak ditemukan";
+    var row = el.closest("tr");
+    if (row) {
+      var cells = row.querySelectorAll("td, th");
+      for (var i = 0; i < cells.length; i++) {
+        if (cells[i] === el && i + 1 < cells.length) {
+          var value = teksEl(cells[i + 1]);
+          if (value) return value.slice(0, 200);
+        }
+      }
+    }
+    var sibling = el.nextElementSibling;
+    if (sibling) {
+      var siblingText = teksEl(sibling);
+      if (siblingText && siblingText.length <= 200) return siblingText;
+    }
+    var text = teksEl(el);
+    var match = text.match(/status(?:\s+(?:password|pelanggan))?\s*[:\-]\s*(.+)$/i);
+    if (match && match[1]) return match[1].trim().slice(0, 200);
+    return "Status tidak terbaca";
+  }
+
+  function maskPasswordValues() {
+    var changes = [];
+    function hide(el) {
+      if (!el || el.nodeType !== 1) return;
+      if (el.__getembassyMasked) return;
+      el.__getembassyMasked = true;
+      changes.push({ el: el, filter: el.style.filter });
+      el.style.filter = "blur(7px)";
+    }
+
+    var passwordInputs = document.querySelectorAll("input[type='password']");
+    for (var i = 0; i < passwordInputs.length; i++) hide(passwordInputs[i]);
+
+    var labelled = document.querySelectorAll("[aria-label], [name], [id]");
+    for (var j = 0; j < labelled.length; j++) {
+      var attrs = [
+        labelled[j].getAttribute("aria-label") || "",
+        labelled[j].getAttribute("name") || "",
+        labelled[j].getAttribute("id") || "",
+      ].join(" ");
+      if (/password/i.test(attrs)) hide(labelled[j]);
+    }
+
+    var cells = document.querySelectorAll("td, th");
+    for (var k = 0; k < cells.length; k++) {
+      var cell = cells[k];
+      var text = teksEl(cell);
+      if (!/^password\b/i.test(text)) continue;
+      if (/password\s*[:\-]/i.test(text)) hide(cell);
+      if (cell.tagName.toLowerCase() !== "th") {
+        var next = cell.nextElementSibling;
+        if (next) hide(next);
+      }
+      var row = cell.closest("tr");
+      if (!row) continue;
+      var table = row.closest("table");
+      if (!table) continue;
+      var rowCells = row.querySelectorAll("th, td");
+      var column = Array.prototype.indexOf.call(rowCells, cell);
+      if (column < 0) continue;
+      var rows = table.querySelectorAll("tr");
+      for (var r = 0; r < rows.length; r++) {
+        var otherCells = rows[r].querySelectorAll("th, td");
+        if (otherCells[column]) hide(otherCells[column]);
+      }
+    }
+
+    return function restore() {
+      for (var n = 0; n < changes.length; n++) {
+        changes[n].el.style.filter = changes[n].filter;
+        delete changes[n].el.__getembassyMasked;
+      }
+    };
+  }
+
+  async function lanjutPassword(st) {
+    if (st.step === "password_cek") {
+      setStatus("⚙️ Password check " + st.nomor + " ...");
+      if (!isiNomor(st.nomor)) throw new Error("Kolom input Nomor Internet tidak ditemukan.");
+      st.step = "password_hasil";
+      st.password_clicked = true;
+      simpanState(st);
+      if (!klikTeks(TEKS_TOMBOL_PASSWORD, true)) {
+        throw new Error("Tombol '" + TEKS_TOMBOL_PASSWORD + "' tidak ditemukan.");
+      }
+      await tungguTenang(WAIT_PASSWORD_MS);
+    } else {
+      await tungguTenang(WAIT_PASSWORD_MS);
+    }
+    st.status = bacaStatusPassword();
+    st.step = "password_screenshot";
+    simpanState(st);
+    return lanjutKeScreenshot(st);
+  }
+
   // Paket sudah berisi → klik "Last Five Usage".
   async function lanjutKeLfu(st) {
     st.step = "lfu";
@@ -429,13 +692,15 @@
 
   async function lanjutKeScreenshot(st) {
     setStatus("📸 Ambil screenshot " + st.nomor + " ...");
-    var foto = await ambilSS();
+    var foto = await ambilSS(st.jenis);
     if (!foto) throw new Error("Screenshot kosong.");
     var payload = {
       id: st.id,
       chat_id: st.chat_id,
       message_id: st.message_id,
       nomor: st.nomor,
+      jenis: st.jenis || "embassy",
+      status: st.status || "",
       foto: foto,
       paket_ok: !!st.paket_ok,
       lfu_ok: !!st.lfu_ok,
@@ -460,6 +725,7 @@
     var st = bacaState();
     if (!st) return false;
     if (sudahHandled(st.id)) { hapusState(); return false; }
+    st.jenis = st.jenis === "password" ? "password" : "embassy";
     st.resume = (st.resume || 0) + 1;
     simpanState(st);
     if (st.attempts >= MAX_ATTEMPTS || st.resume >= MAX_ATTEMPTS) {
@@ -469,7 +735,8 @@
         await laporGagal({
           id: st.id, status: "gagal",
           pesan: "Proses terulang karena halaman reload berulang.",
-          chat_id: st.chat_id, message_id: st.message_id, nomor: st.nomor,
+          chat_id: st.chat_id, message_id: st.message_id,
+          nomor: st.nomor, jenis: st.jenis,
         });
       } catch (e) {}
       hapusState();
@@ -479,9 +746,21 @@
     lagiProses = true;
     setStatus("↩️ Lanjut " + st.nomor + " (" + st.step + ")...");
     try {
-      await tungguTenang(6000); // tunggu halaman baru render
-      if (st.step === "lfu") {
-        // Refresh selalu menutup panel LFU → klik ulang biar screenshot berisi LFU.
+      await tungguTenang(6000);
+      var navigasi = await bukaHalaman(st.jenis);
+      if (navigasi !== "ready") return true;
+      if (st.jenis === "password" && st.step === "password_cek") {
+        if (!await tungguFormTugas(st.jenis)) {
+          throw new Error("Form Password Check belum siap.");
+        }
+      } else if (st.jenis === "embassy" && st.step === "cek") {
+        if (!await tungguFormTugas(st.jenis)) {
+          throw new Error("Form Embassy belum siap.");
+        }
+      }
+      if (st.jenis === "password") {
+        await lanjutPassword(st);
+      } else if (st.step === "lfu") {
         await lanjutKeLfu(st);
       } else {
         await lanjutDariCek(st);
@@ -492,7 +771,8 @@
       try {
         await laporGagal({
           id: st.id, status: "gagal", pesan: String(err).slice(0, 200),
-          chat_id: st.chat_id, message_id: st.message_id, nomor: st.nomor,
+          chat_id: st.chat_id, message_id: st.message_id,
+          nomor: st.nomor, jenis: st.jenis,
         });
       } catch (e) {}
       hapusState();
@@ -504,12 +784,13 @@
     return true;
   }
 
-  function ambilSS() {
+  function ambilSS(jenis) {
     return new Promise(function (resolve, reject) {
       if (typeof html2canvas === "undefined") {
         reject(new Error("html2canvas belum dimuat (cek @require/internet)."));
         return;
       }
+      var restore = jenis === "password" ? maskPasswordValues() : function () {};
       var doc = document.documentElement;
       var w = Math.max(document.body.scrollWidth, doc.scrollWidth, window.innerWidth);
       var h = Math.max(document.body.scrollHeight, doc.scrollHeight, window.innerHeight);
@@ -549,8 +830,12 @@
         logging: false,
       }).then(function (canvas) {
         var dataUrl = canvas.toDataURL("image/png");
+        restore();
         resolve(dataUrl.indexOf(",") >= 0 ? dataUrl.split(",")[1] : "");
-      }).catch(reject);
+      }).catch(function (err) {
+        restore();
+        reject(err);
+      });
     });
   }
 
@@ -670,7 +955,7 @@
 
   function updateTampilanAuto() {
     if (!toggleBtn) return;
-    toggleBtn.textContent = autoAktif ? "⏸ Auto: ON" : "▶ Auto: OFF";
+    toggleBtn.textContent = autoAktif ? "ON" : "OFF";
     toggleBtn.style.background = autoAktif ? "#2e7d32" : "#8a8a8a";
     if (!lagiProses) {
       setStatus(autoAktif ? "🟢 GetEmbassy: idle" : "⏸ GetEmbassy: mati");
@@ -680,48 +965,57 @@
   // ===================== LOOP UTAMA =====================
 
   async function prosesSatu(task) {
-    if (!autoAktif) return;
-    if (sudahHandled(task.id)) return;
+    if (!autoAktif) return false;
+    if (sudahHandled(task.id)) return false;
     var stateAda = bacaState();
     if (stateAda) {
-      if (stateAda.id === task.id) return; // masih tengah diproses / diproses di-resume
-      hapusState(); // state lama orphan → buang, mulai baru
+      if (sudahHandled(stateAda.id)) hapusState();
+      else return false;
     }
+    var jenis = task.jenis === "password" ? "password" : "embassy";
+    var perluNavigasi = false;
     idAktif = task.id;
     lagiProses = true;
-    log("Proses antrian " + task.id + " nomor " + task.nomor);
+    log("Proses antrian " + task.id + " jenis " + jenis + " nomor " + task.nomor);
     try {
-      if (!/radonline/i.test(location.href)) {
-        setStatus("🔴 bukan halaman embassy (" + task.nomor + ")");
-        await laporGagal({
-          id: task.id, status: "gagal", pesan: "Halaman Gladius ini bukan halaman embassy.",
-          chat_id: task.chat_id, message_id: task.message_id, nomor: task.nomor,
-        });
-        return;
-      }
-
       var st = {
-        id: task.id, nomor: task.nomor, chat_id: task.chat_id, message_id: task.message_id,
-        step: "cek", attempts: 0, resume: 0, coba: [], paket_ok: false, lfu_ok: false,
-        lfu_clicked: false, domain: null,
+        id: task.id, nomor: task.nomor, jenis: jenis,
+        chat_id: task.chat_id, message_id: task.message_id,
+        step: jenis === "password" ? "password_cek" : "cek",
+        attempts: 0, resume: 0, coba: [], paket_ok: false, lfu_ok: false,
+        lfu_clicked: false, domain: null, status: "", password_clicked: false,
       };
       simpanState(st);
 
       setStatus("⚙️ Proses " + task.nomor + " ...");
-      if (!isiNomor(task.nomor)) throw new Error("Kolom input Nomor Internet tidak ditemukan.");
-      if (!klikTeks(TEKS_TOMBOL_CEK, true)) throw new Error("Tombol '" + TEKS_TOMBOL_CEK + "' tidak ditemukan.");
-      await tungguTenang(WAIT_HASIL_MS);
-
-      // Sampai di sini berarti klik TIDAK memicu reload → proses berlanjut inline.
-      // Kalau reload terjadi, script mati dan resume('cek') yang meneruskan.
-      await lanjutDariCek(bacaState() || st);
+      var navigasi = await bukaHalaman(jenis);
+      if (navigasi !== "ready") {
+        perluNavigasi = true;
+        return true;
+      }
+      if (!await tungguFormTugas(jenis)) {
+        throw new Error(
+          jenis === "password"
+            ? "Form Password Check belum siap."
+            : "Form Embassy belum siap."
+        );
+      }
+      if (jenis === "password") {
+        await lanjutPassword(st);
+      } else {
+        if (!isiNomor(task.nomor)) throw new Error("Kolom input Nomor Internet tidak ditemukan.");
+        if (!klikTeks(TEKS_TOMBOL_CEK, true)) throw new Error("Tombol '" + TEKS_TOMBOL_CEK + "' tidak ditemukan.");
+        await tungguTenang(WAIT_HASIL_MS);
+        await lanjutDariCek(bacaState() || st);
+      }
     } catch (err) {
       setStatus("🔴 Gagal proses " + task.nomor);
       log("Gagal: " + err);
       try {
         await laporGagal({
           id: task.id, status: "gagal", pesan: String(err).slice(0, 200),
-          chat_id: task.chat_id, message_id: task.message_id, nomor: task.nomor,
+          chat_id: task.chat_id, message_id: task.message_id,
+          nomor: task.nomor, jenis: jenis,
         });
       } catch (e) {}
       hapusState();
@@ -730,6 +1024,7 @@
       idAktif = null;
       updateTampilanAuto();
     }
+    return perluNavigasi;
   }
 
   async function loopSiklus() {
@@ -737,12 +1032,33 @@
       try {
         var items = await ambilAntrian();
         if (items.length > 0) log("Antrian: " + items.length + " item");
+        var stateAntrian = bacaState();
+        if (stateAntrian && !sudahHandled(stateAntrian.id)) {
+          var masihPending = false;
+          for (var si = 0; si < items.length; si++) {
+            if (items[si].id === stateAntrian.id) { masihPending = true; break; }
+          }
+          if (!masihPending) hapusState();
+        }
+        var stateLanjut = bacaState();
+        if (
+          stateLanjut &&
+          !sudahHandled(stateLanjut.id) &&
+          !idAktif &&
+          diHalamanTarget(stateLanjut.jenis)
+        ) {
+          await cobaResumeSetelahReload();
+          continue;
+        }
         for (var i = 0; i < items.length; i++) {
           if (!autoAktif) break;
           var it = items[i];
           if (sudahHandled(it.id)) continue;
           if (idAktif && it.id === idAktif) continue;
-          await prosesSatu(it);
+          var stateSekarang = bacaState();
+          if (stateSekarang && !sudahHandled(stateSekarang.id) && stateSekarang.id !== it.id) continue;
+          var pindah = await prosesSatu(it);
+          if (pindah) break;
           if (autoAktif) await tidur(1500);
         }
       } catch (err) {
