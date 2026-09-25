@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GetEmbassy Gladius - Proses Otomatis
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
+// @version      1.2.0
 // @description  [GetEmbassy] Auto-proses antrian /embassy dari bot Railway langsung di halaman Gladius: isi Nomor Internet, Cek Kualitas Jaringan, loop dropdown domain sampai Paket Radius/PCRF berisi, Last Five Usage, screenshot (html2canvas), lalu kirim base64 ke Railway. Tanpa Python/Selenium/debug port.
 // @author       diana
 // @match        https://gladius.telkom.co.id/*
@@ -303,9 +303,26 @@
     return null;
   }
 
+  // Poll sel paket sampai terisi atau timeout (anti "fake empty": halaman hasil
+  // Gladius kadang masih render saat resume, baca 1× bisa kelewat → LFU terlewat).
+  function tungguHasilPaket(maxMs) {
+    maxMs = maxMs || 12000;
+    return new Promise(function (resolve) {
+      var mulai = Date.now();
+      (function poll() {
+        var v = bacaPaket();
+        if (!paketKosong(v) || Date.now() - mulai >= maxMs) {
+          resolve(v);
+          return;
+        }
+        setTimeout(poll, 1000);
+      })();
+    });
+  }
+
   // Setelah tombol "Cek" ditekan (inline ATAU resume pasca-reload): baca hasilnya.
   async function lanjutDariCek(st) {
-    var paket = bacaPaket();
+    var paket = await tungguHasilPaket(12000);
     if (!paketKosong(paket)) {
       st.paket_ok = true;
       st.domain = bacaDomainTerpilih() || null;
@@ -335,16 +352,23 @@
   // Paket sudah berisi → klik "Last Five Usage".
   async function lanjutKeLfu(st) {
     st.step = "lfu";
-    st.lfu_clicked = true;
-    st.lfu_ok = true;
+    st.lfu_clicked = false;
+    st.lfu_ok = false;
     simpanState(st);
     setStatus("⚙️ " + st.nomor + " · Last Five Usage...");
     if (klikTeks(TEKS_TOMBOL_LFU, true)) {
+      st.lfu_clicked = true;
+      simpanState(st);
       await tungguTenang(WAIT_LFU_MS);
-      // Bila klik memicu reload → mati di sini; resume 'lfu' langsung ke screenshot.
+      st.lfu_ok = true;
+      simpanState(st);
+      // Bila klik memicu reload → mati di sini; resume 'lfu' akan klik ulang lagi.
       return lanjutKeScreenshot(bacaState() || st);
     }
-    st.lfu_clicked = false;
+    // Tombol tidak ketemu → jangan diam-diam: tandai lfu_ok=false + warning,
+    // screenshot tetap dikirim (caption nanti memuat catatan LFU gagal).
+    setStatus("⚠️ " + st.nomor + " · tombol Last Five Usage tidak ditemukan");
+    log("LFU tidak ditemukan untuk " + st.nomor + " (screenshot tetap dikirim).");
     return lanjutKeScreenshot(st);
   }
 
@@ -402,7 +426,8 @@
     try {
       await tungguTenang(6000); // tunggu halaman baru render
       if (st.step === "lfu") {
-        await lanjutKeScreenshot(st);
+        // Refresh selalu menutup panel LFU → klik ulang biar screenshot berisi LFU.
+        await lanjutKeLfu(st);
       } else {
         await lanjutDariCek(st);
       }

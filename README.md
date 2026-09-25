@@ -114,7 +114,7 @@ Isi: `TELEGRAM_BOT_TOKEN`, `RAILWAY_URL`, `AGENT_SECRET`.
 
 > Satu user/PIC harus menjaga tab Chrome ini tetap menyala + login agar robot bisa dipakai. Tidak perlu Python/Selenium/debug port lagi. Jika tab mati, bot otomatis menginfokan "Server Gladius tidak tersambung".
 >
-> **Catatan reload:** halaman Gladius memang me-reload tiap kali tombol Cek/Last Five diklik dan kadang auto-refresh sendiri. Script menoleransi itu — ia menyimpan checkpoint per langkah dan **melanjutkan dari langkah terakhir** setelah reload (badge akan menunjuk `↩️ Lanjut <nomor> ...`), bukan mengulang dari nol.
+> **Catatan reload:** halaman Gladius memang me-reload tiap kali tombol Cek/Last Five diklik dan kadang auto-refresh sendiri. Script menoleransi itu — ia menyimpan checkpoint per langkah dan **melanjutkan dari langkah terakhir** setelah reload (badge akan menunjuk `↩️ Lanjut <nomor> ...`), bukan mengulang dari nol. Karena refresh selalu menutup kembali panel "Last Five Usage", pada resume step `lfu` tombol LFU **diklik ulang** sebelum screenshot biar hasilnya tetap memuat tabel Last Five Usage.
 
 ### Test tanpa Telegram (opsional)
 
