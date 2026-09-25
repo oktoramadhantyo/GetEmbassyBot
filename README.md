@@ -1,8 +1,8 @@
 # Projek Magang - GetEmbassy
 
-Bot Telegram (Python) untuk memeriksa nomor Embassy di Web Gladius dan mengirim 1 screenshot hasilnya ke user Telegram.
+Bot Telegram untuk memeriksa nomor Embassy di Web Gladius dan mengirim 1 screenshot hasilnya ke user Telegram.
 
-Arsitektur: **bot di Railway (online 24 jam) + agent lokal di laptop PIC** (yang memegang Chrome yang sudah login Gladius). Tidak perlu Google Sheets / tunnel — agent menanya antrian ke Railway via HTTP.
+Arsitektur: **bot di Railway (online 24 jam) + UserScript Tampermonkey di browser laptop PIC** (yang memegang session login Gladius). Tidak perlu Python lokal / Selenium / Chrome debug port. UserScript menanya antrian ke Railway via HTTP, memproses cek embassy langsung di dalam halaman Gladius, lalu mengirim screenshot (html2canvas) kembali ke Railway untuk dikirim ke user.
 
 ## Arsitektur
 
@@ -15,20 +15,24 @@ Arsitektur: **bot di Railway (online 24 jam) + agent lokal di laptop PIC** (yang
      ▼                                 │
 [GET /antrian?secret=...]──────┐       │
                                 ▼       │
-[laptop PIC: agent.py]   (tiap 10 dtk)  │
-     │  attach Chrome debug port 9222                        │
-     │  (login Gladius) → cek embassy → 1 screenshot          │
-     ├── sendPhoto (langsung balas user via bot API)          │
-     └── POST /selesai?secret=... (infokan selesai/gagal) ────┘
+[Chrome PIC: gladius-embassy.user.js] (tiap 10 dtk, Tampermonkey)
+     │  halaman Gladius sudah login
+     │  → isi nomor → Cek Kualitas Jaringan → loop domain
+     │    sampai Paket Radius/PCRF berisi → Last Five Usage
+     │  → screenshot html2canvas → base64
+     ├── POST /kirim?secret=... (foto + caption → Railway kirim ke user)
+     └── POST /selesai?secret=... (laporan gagal jika perlu)
 ```
 
-Jika antrian pending tidak diproses agent dalam `WAIT_ANNOUNCE_MENIT` menit, bot mengedit pesan user menjadi:
+Jika antrian pending tidak diproses dalam `WAIT_ANNOUNCE_MENIT` menit, bot mengedit pesan user menjadi:
 
 ```
 ⚠️ Server Gladius tidak tersambung.
 Petugas yang menjaga bot belum aktif / Chrome Gladius belum berjalan.
 Silakan dicoba lagi nanti.
 ```
+
+> Versi lama (Python lokal: `agent.py` + Selenium + Chrome debug port) tetap disimpan sebagai referensi, tetapi **tidak lagi dipakai**. Nilai selector sama, jadi test `python -m scraper.embassy <nomor> --dump` tetap berguna untuk validasi struktur halaman.
 
 ## Perintah Bot
 
@@ -43,19 +47,20 @@ Silakan dicoba lagi nanti.
 ```
 Projek Magang-GetEmbassy/
 ├── README.md
-├── bot.py               # sisi RAILWAY: PTB polling + antrian + HTTP /antrian /selesai /health
-├── agent.py             # sisi LOKAL (laptop PIC): polling antrian → Selenium → kirim hasil
-├── config.py            # konfigurasi pusat via .env
+├── bot.py                    # sisi RAILWAY: PTB polling + antrian + HTTP /antrian /kirim /selesai /health
+├── agent.py                  # (LAMA, opsional) agent Selenium lokal
+├── config.py                 # konfigurasi pusat via .env
+├── gladius-embassy.user.js   # (BARU) UserScript Tampermonkey di Chrome PIC — jalankan proses cek embassy
 ├── scraper/
-│   ├── browser.py       # cek debug port + attach Chrome login existing
-│   └── embassy.py       # cari + 1 screenshot embassy & last five usage
+│   ├── browser.py            # (dipakai agent.py lama) cek debug port + attach Chrome login existing
+│   └── embassy.py            # logika cek embassy (sumber JS selector + test CLI --dump)
 ├── requirements.txt
-├── .env.example         # template .env
-├── .env                 # (gitignored) token & setting
-├── Procfile             # web: python bot.py
-├── start_agent.bat      # (laptop PIC) doibel-klik: Chrome debug + jalankan agent
+├── .env.example              # template .env
+├── .env                      # (gitignored) token & setting
+├── Procfile                  # web: python bot.py
+├── start_agent.bat           # (LAMA, opsional) auto Chrome debug + run agent lama
 ├── Screenshot 2026-09-22 125002.png
-└── outputs/             # hasil screenshot (gitignored)
+└── outputs/                  # hasil screenshot (gitignored)
 ```
 
 ## Teknologi
@@ -91,31 +96,23 @@ Isi: `TELEGRAM_BOT_TOKEN`, `RAILWAY_URL`, `AGENT_SECRET`.
    - `AGENT_SECRET` (nilai diterima spesifik SAMA dengan `.env` agent)
    - `WAIT_ANNOUNCE_MENIT` (opsional)
 4. Railway otomatis mendeteksi `Procfile` (`web: python bot.py`) dan mengekspos URL publik, misal `https://getembassybot.up.railway.app`.
-5. Salin URL itu ke `.env` agent (`RAILWAY_URL`).
+5. Salin URL itu ke `RAILWAY_URL` (di `.env` dan di konfigurasi userscript).
 6. Cek endpoint di browser: `https://<url>.up.railway.app/health` → `{"ok": true}`.
 
 > Catatan: `PORT` di-inject otomatis oleh Railway; batas `WAIT_ANNOUNCE_MENIT` untuk announce "tidak tersambung".
 
-### 4. Jalankan agent lokal (laptop PIC)
+### 4. Pasang UserScript Tampermonkey (laptop PIC)
 
-**Cara termudah: doibel-klik `start_agent.bat`** (auto-detect `chrome.exe`, buka Chrome debug dengan profil terpisah `chrome-profile`, lalu jalankan `python agent.py`).
+1. Pasang ekstensi **Tampermonkey** di Chrome.
+2. Buat script baru → tempel isi `gladius-embassy.user.js`.
+3. Sesuaikan bagian **KONFIGURASI** di atas file:
+   - `RAILWAY_URL` = URL bot di Railway.
+   - `AGENT_SECRET` = sama persis dengan value di Railway/`.env`.
+4. Buka halaman embassy Gladius → **login** → biarkan tab ini selalu terbuka:
+   `https://gladius.telkom.co.id/radonline/newradonline`
+5. Pastikan badge **🟢 GetEmbassy: idle** muncul di bawah kanan. Klik tombol `⏸ Auto: ON` untuk mati/nyalakan (mudah dicek).
 
-**Atau manual:**
-
-1. Buka Chrome dengan remote debugging:
-
-   ```powershell
-   chrome.exe --remote-debugging-port=9222 --user-data-dir="C:\chrome-debug"
-   ```
-
-2. Login Gladius → buka halaman embassy → biarkan tab terbuka.
-3. Jalankan agent:
-
-   ```bash
-   python agent.py
-   ```
-
-> Satu user/PIC harus menjaga Chrome ini tetap menyala + login agar robot bisa dipakai. Jika tidak, bot otomatis menginfokan "Server Gladius tidak tersambung".
+> Satu user/PIC harus menjaga tab Chrome ini tetap menyala + login agar robot bisa dipakai. Tidak perlu Python/Selenium/debug port lagi. Jika tab mati, bot otomatis menginfokan "Server Gladius tidak tersambung".
 
 ### Test tanpa Telegram (opsional)
 
@@ -146,9 +143,11 @@ Selector halaman Gladius belum terdokumentasi; elemen dicari toleran berdasarkan
 - [x] Konfirmasi URL + cara masuk Web Gladius
 - [x] Handler `/embassy <nomor>`
 - [x] Announcement "Server Gladius tidak tersambung" + `/status`
-- [x] Arsitektur Railway + agent lokal (tanpa Google Sheets/tunnel)
+- [x] Arsitektur Railway + agent (awalnya agent lokal, lihat bawah)
 - [x] Scraper pencarian nomor embassy di Web Gladius
 - [x] Screenshot hasil Embassy + Last Five Usage (1 gambar)
 - [x] Penanganan gagal riwayat → tetap kirim screenshot Embassy
-- [ ] Test end-to-end via Telegram (validasi selector & posisi screenshot)
-- [ ] Deploy Railway + jalankan agent
+- [x] UserScript Tampermonkey `gladius-embassy.user.js` (ganti agent Python-lokal: polling `/antrian`, proses di halaman, html2canvas screenshot, kirim ke `/kirim`)
+- [x] Railway endpoint `/kirim` (relay foto base64 → sendPhoto + edit pesan) & `/selesai` (edit pesan gagal)
+- [ ] Test end-to-end via Telegram: pasang userscript di Chrome PIC, kirim `/embassy <nomor>`, validasi selector/posisi screenshot (html2canvas — ingat risiko iframe)
+- [ ] Deploy Railway versi baru (dengan `/kirim`) + jalankan browser PIC dengan userscript aktif

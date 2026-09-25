@@ -7,18 +7,23 @@ agent lokal (laptop PIC) yang memegang Chrome + Gladius.
 
 Alur:
   /embassy <nomor>  -> tulis antrian + balas "Embassy: mengukur ..."
-  agent lokal       -> GET /antrian -> proses Selenium -> kirim hasil langsung
-                       ke user (sendPhoto/editMessageText) -> POST /selesai
+  userscript (Tampermonkey di Chrome Gladius)
+                   -> GET /antrian -> proses di halaman (html2canvas)
+                      -> POST /kirim (foto base64 + info) -> bot send ke user
+                      -> POST /selesai untuk pelaporan status gagal
   Jika antrian tidak diproses dalam WAIT_ANNOUNCE_MENIT menit, pesan status
   diedit menjadi "Server Gladius tidak tersambung".
 
 Endpoint HTTP (semua butuh ?secret=AGENT_SECRET):
   GET  /antrian   -> daftar permintaan status=pending
-  POST /selesai   -> agent melaporkan hasil (id, status, pesan)
+  POST /kirim     -> relay foto hasil (base64) -> sendPhoto ke user + edit pesan
+  POST /selesai   -> pelaporan status (id, status, pesan) + edit pesan gagal
   GET  /health    -> penanda bot hidup
 """
 
 import asyncio
+import base64
+import io
 import json
 import logging
 import re
@@ -27,11 +32,13 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from config import (
     AGENT_SECRET,
+    DAFTAR_DOMAIN,
     PORT_HTTP,
     TOKEN,
     WAIT_ANNOUNCE_MENIT,
@@ -112,7 +119,40 @@ def _ringkasan_status() -> str:
         return f"Bot online ✓\n{kondisi}\nTerakhir: {jam} ({st})"
 
 
-# ==================== HTTP ENDPOINT (dipanggil agent lokal) ====================
+# ==================== TELEGRAM API (relay foto dari userscript) ====================
+_TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
+
+
+def _tele_post(path: str, files=None, data: dict | None = None) -> dict:
+    try:
+        r = requests.post(
+            f"{_TELEGRAM_API}/{path}",
+            files=files,
+            data=data or {},
+            timeout=120,
+        )
+        return r.json()
+    except Exception as exc:
+        logger.warning("Telegram API %s gagal: %s", path, exc)
+        return {"ok": False}
+
+
+def _caption_hasil(nomor: str, waktu: str, paket_ok: bool, lfu_ok: bool) -> str:
+    caption = f"Embassy {nomor} | {waktu}"
+    if not paket_ok:
+        caption += (
+            f"\nPaket Radius/PCRF tidak ditemukan dalam "
+            f"{len(DAFTAR_DOMAIN)} domain."
+        )
+    elif not lfu_ok:
+        caption += (
+            "\nLast Five Usage gagal atau tidak selesai dimuat. "
+            "Gambar berikut adalah hasil Embassy sebelum percobaan riwayat."
+        )
+    return caption
+
+
+# ==================== HTTP ENDPOINT (dipanggil userscript Tampermonkey) ====================
 class _Handler(BaseHTTPRequestHandler):
     def _kirim(self, kode: int, obj) -> None:
         body = json.dumps(obj).encode("utf-8")
@@ -160,9 +200,68 @@ class _Handler(BaseHTTPRequestHandler):
             pesan = data.get("pesan", "")
             if tid:
                 _tandai_task(tid, status, pesan)
+                if status == "gagal" and pesan:
+                    chat_id = data.get("chat_id")
+                    message_id = data.get("message_id")
+                    nomor = str(data.get("nomor", ""))
+                    if chat_id is not None and message_id is not None:
+                        _tele_post(
+                            "editMessageText",
+                            data={
+                                "chat_id": chat_id,
+                                "message_id": message_id,
+                                "text": f"Gagal memeriksa Embassy {nomor}:\n{pesan}"[:1024],
+                            },
+                        )
             self._kirim(200, {"ok": True})
+        elif path == "/kirim":
+            self._proses_kirim_hasil()
         else:
             self._kirim(404, {"ok": False})
+
+    def _proses_kirim_hasil(self):
+        """Terima foto hasil dari userscript (base64) -> sendPhoto + edit pesan."""
+        data = self._baca_json()
+        tid = str(data.get("id", ""))
+        chat_id = data.get("chat_id")
+        message_id = data.get("message_id")
+        nomor = str(data.get("nomor", ""))
+        foto_b64 = data.get("foto", "")
+        paket_ok = bool(data.get("paket_ok"))
+        lfu_ok = bool(data.get("lfu_ok"))
+        waktu = str(data.get("waktu", ""))
+
+        if not (tid and chat_id is not None and message_id is not None and foto_b64):
+            self._kirim(200, {"ok": False, "error": "payload tidak lengkap"})
+            return
+
+        try:
+            foto_bytes = base64.b64decode(foto_b64)
+        except Exception:
+            self._kirim(200, {"ok": False, "error": "base64 foto tidak valid"})
+            return
+
+        caption = _caption_hasil(nomor, waktu, paket_ok, lfu_ok)
+        terkirim = _tele_post(
+            "sendPhoto",
+            files={"photo": io.BytesIO(foto_bytes)},
+            data={"chat_id": chat_id, "caption": caption},
+        ).get("ok", False)
+
+        if terkirim:
+            _tele_post(
+                "editMessageText",
+                data={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": "Selesai ✓",
+                },
+            )
+            _tandai_task(tid, "selesai", "")
+        else:
+            _tandai_task(tid, "selesai", "gagal kirim foto dari userscript")
+
+        self._kirim(200, {"ok": True, "sent": terkirim})
 
     def log_message(self, *args):
         pass
