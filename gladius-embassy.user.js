@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GetEmbassy Gladius - Proses Otomatis
 // @namespace    http://tampermonkey.net/
-// @version      1.3.0
+// @version      1.3.1
 // @description  [GetEmbassy] Auto-proses antrian /embassy dari bot Railway langsung di halaman Gladius: isi Nomor Internet, Cek Kualitas Jaringan, loop dropdown domain sampai Paket Radius/PCRF berisi, Last Five Usage, screenshot (html2canvas), lalu kirim base64 ke Railway. Tanpa Python/Selenium/debug port.
 // @author       diana
 // @match        https://gladius.telkom.co.id/*
@@ -40,7 +40,7 @@
   // bukan mengulang dari nol (mencegah loop klik->reload).
   var STATE_KEY = "getembassy_state";
   var HANDLED_KEY = "getembassy_handled";
-  var MAX_ATTEMPTS = 6;          // batas percobaan/reload per task
+  var MAX_ATTEMPTS = 6; // batas percobaan/reload per task
   var STATE_TTL_MS = 6 * 60 * 1000;
   var HANDLED_TTL_MS = 5 * 60 * 1000;
 
@@ -535,7 +535,7 @@
       }
       if (!box) box = { left: 0, top: 0, right: w, bottom: h };
       try { window.scrollTo(0, box.top); } catch (e) {}
-      html2canvas(document.body, {
+      window.html2canvas(document.body, {
         useCORS: true,
         allowTaint: false,
         scale: Math.min(window.devicePixelRatio || 1, SS_SCALE),
@@ -685,7 +685,7 @@
     var stateAda = bacaState();
     if (stateAda) {
       if (stateAda.id === task.id) return; // masih tengah diproses / diproses di-resume
-      hapusState();                        // state lama orphan → buang, mulai baru
+      hapusState(); // state lama orphan → buang, mulai baru
     }
     idAktif = task.id;
     lagiProses = true;
