@@ -108,6 +108,7 @@ Isi: `TELEGRAM_BOT_TOKEN`, `RAILWAY_URL`, `AGENT_SECRET`.
 3. Sesuaikan bagian **KONFIGURASI** di atas file:
    - `RAILWAY_URL` = URL bot di Railway.
    - `AGENT_SECRET` = sama persis dengan value di Railway/`.env`.
+   - `SS_CROP = "auto"` = screenshot di-crop ke area hasil ukur saja (sidebar/logo Gladius + tabel hasil + Last Five Usage), `SS_SCALE` = tingkat kecil/besar (default `1`). Kalau auto-crop kurang pas, isi `SS_CROP_OVERRIDE` mis. `{left: 0, top: 0, right: 1400, bottom: 2100}` untuk angka pasti.
 4. Buka halaman embassy Gladius → **login** → biarkan tab ini selalu terbuka:
    `https://gladius.telkom.co.id/radonline/newradonline`
 5. Pastikan badge **🟢 GetEmbassy: idle** muncul di bawah kanan. Klik tombol `⏸ Auto: ON` untuk mati/nyalakan (mudah dicek).

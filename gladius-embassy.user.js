@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GetEmbassy Gladius - Proses Otomatis
 // @namespace    http://tampermonkey.net/
-// @version      1.2.0
+// @version      1.3.0
 // @description  [GetEmbassy] Auto-proses antrian /embassy dari bot Railway langsung di halaman Gladius: isi Nomor Internet, Cek Kualitas Jaringan, loop dropdown domain sampai Paket Radius/PCRF berisi, Last Five Usage, screenshot (html2canvas), lalu kirim base64 ke Railway. Tanpa Python/Selenium/debug port.
 // @author       diana
 // @match        https://gladius.telkom.co.id/*
@@ -20,7 +20,10 @@
   var POLL_INTERVAL_DETIK = 10; // jeda polling antrian
   var WAIT_HASIL_MS = 15000; // tunggu hasil "Cek Kualitas Jaringan" stabil
   var WAIT_LFU_MS = 15000; // tunggu "Last Five Usage" selesai dimuat
-  var SS_SCALE = 2; // kualitas screenshot (devicePixelRatio dibatasi)
+  var SS_SCALE = 1; // skala screenshot (lebih kecil = file ringan, hasil ± lebar area crop)
+  var SS_CROP = "auto"; // "auto" = area hasil ukur (sidebar+logo+tabel hasil+LFU) | "none" = full page
+  var SS_CROP_PAD = 16; // ruang ekstra di sekeliling area hasil (px)
+  var SS_CROP_OVERRIDE = null; // kalau auto meleset: isi {left, top, right, bottom}
 
   var DAFTAR_DOMAIN = ["apps.telkom", "telkom.net", "gold.telkom", "telkom.b2b"];
   var NILAI_PAKET_KOSONG = ["/", "-", "", "0", "n/a", "na", "kosong", "null", "none"];
@@ -270,6 +273,58 @@
     return NILAI_PAKET_KOSONG.indexOf(nilai) >= 0;
   }
 
+  function rectAbs(el) {
+    var r = el.getBoundingClientRect();
+    return {
+      left: r.left + window.scrollX,
+      top: r.top + window.scrollY,
+      right: r.right + window.scrollX,
+      bottom: r.bottom + window.scrollY,
+    };
+  }
+
+  function gabungRect(a, b) {
+    if (!a) return b;
+    if (!b) return a;
+    return {
+      left: Math.min(a.left, b.left),
+      top: Math.min(a.top, b.top),
+      right: Math.max(a.right, b.right),
+      bottom: Math.max(a.bottom, b.bottom),
+    };
+  }
+
+  // Area "hasil ukur" untuk screenshot: tabel hasil Embassy ("paket radius/pcrf")
+  // + panel "Last Five Usage", ditambah sidebar/logo Gladius di kiri atas.
+  function cariKotakHasil() {
+    function norm(s) { return (s || "").replace(/\s+/g, " ").trim(); }
+    function esc(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+    var kw = TEKS_KOLOM_PAKET, alt = TEKS_KOLOM_PAKET_ALT;
+    var pat = new RegExp("(?:" + esc(kw) + "|" + esc(alt) + ")", "i");
+    var patLfu = new RegExp(esc(TEKS_TOMBOL_LFU), "i");
+    var box = null;
+    var semua = document.querySelectorAll("td,th,tr,div,span,label,table");
+    for (var i = 0; i < semua.length; i++) {
+      var el = semua[i];
+      var t = norm(el.innerText || el.textContent || "");
+      if (!t || t.length > 4000) continue;
+      if (!t.match(pat) && !t.match(patLfu)) continue;
+      var r = rectAbs(el);
+      if (r.right <= r.left || r.bottom <= r.top) continue;
+      if (r.bottom - r.top > 20000) continue;
+      box = gabungRect(box, r);
+    }
+    if (!box) return null;
+    var doc = document.documentElement;
+    var lebar = Math.max(document.body.scrollWidth, doc.scrollWidth, window.innerWidth);
+    var tinggi = Math.max(document.body.scrollHeight, doc.scrollHeight, window.innerHeight);
+    box.left = 0; // selalu sertakan sidebar/logo kiri
+    box.top = Math.max(0, Math.floor(box.top - SS_CROP_PAD));
+    box.right = Math.min(lebar, Math.ceil(box.right + SS_CROP_PAD));
+    box.bottom = Math.min(tinggi, Math.ceil(box.bottom + SS_CROP_PAD));
+    return box;
+  }
+
   function tungguTenang(kapurMs) {
     return new Promise(function (resolve) {
       var akhir = Date.now() + kapurMs;
@@ -458,10 +513,36 @@
       var doc = document.documentElement;
       var w = Math.max(document.body.scrollWidth, doc.scrollWidth, window.innerWidth);
       var h = Math.max(document.body.scrollHeight, doc.scrollHeight, window.innerHeight);
+      var box = null;
+      var mode = String(SS_CROP || "auto").toLowerCase();
+      if (mode === "auto") {
+        if (SS_CROP_OVERRIDE) {
+          box = {
+            left: Math.max(0, Number(SS_CROP_OVERRIDE.left) || 0),
+            top: Math.max(0, Number(SS_CROP_OVERRIDE.top) || 0),
+            right: Math.min(w, Number(SS_CROP_OVERRIDE.right) || w),
+            bottom: Math.min(h, Number(SS_CROP_OVERRIDE.bottom) || h),
+          };
+        } else {
+          box = cariKotakHasil();
+        }
+        if (box) {
+          box.left = Math.max(0, Math.floor(box.left));
+          box.top = Math.max(0, Math.floor(box.top));
+          box.right = Math.min(w, Math.ceil(box.right));
+          box.bottom = Math.min(h, Math.ceil(box.bottom));
+        }
+      }
+      if (!box) box = { left: 0, top: 0, right: w, bottom: h };
+      try { window.scrollTo(0, box.top); } catch (e) {}
       html2canvas(document.body, {
         useCORS: true,
         allowTaint: false,
         scale: Math.min(window.devicePixelRatio || 1, SS_SCALE),
+        x: box.left,
+        y: box.top,
+        width: Math.max(1, box.right - box.left),
+        height: Math.max(1, box.bottom - box.top),
         windowWidth: w,
         windowHeight: h,
         backgroundColor: "#ffffff",
