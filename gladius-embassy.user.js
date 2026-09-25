@@ -17,10 +17,10 @@
   // ===================== KONFIGURASI (edit sesuai .env / Railway) =====================
   var RAILWAY_URL = "https://getembassybot-production.up.railway.app";
   var AGENT_SECRET = "njcdB4gEitPWyMSFVc58s388";
-  var POLL_INTERVAL_DETIK = 10;        // jeda polling antrian
-  var WAIT_HASIL_MS = 30000;           // tunggu hasil "Cek Kualitas Jaringan" stabil
-  var WAIT_LFU_MS = 30000;             // tunggu "Last Five Usage" selesai dimuat
-  var SS_SCALE = 2;                    // kualitas screenshot (devicePixelRatio dibatasi)
+  var POLL_INTERVAL_DETIK = 10; // jeda polling antrian
+  var WAIT_HASIL_MS = 30000; // tunggu hasil "Cek Kualitas Jaringan" stabil
+  var WAIT_LFU_MS = 30000; // tunggu "Last Five Usage" selesai dimuat
+  var SS_SCALE = 2; // kualitas screenshot (devicePixelRatio dibatasi)
 
   var DAFTAR_DOMAIN = ["apps.telkom", "telkom.net", "gold.telkom", "telkom.b2b"];
   var NILAI_PAKET_KOSONG = ["/", "-", "", "0", "n/a", "na", "kosong", "null", "none"];
