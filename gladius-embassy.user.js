@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GetEmbassy Gladius - Proses Otomatis
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.1.0
 // @description  [GetEmbassy] Auto-proses antrian /embassy dari bot Railway langsung di halaman Gladius: isi Nomor Internet, Cek Kualitas Jaringan, loop dropdown domain sampai Paket Radius/PCRF berisi, Last Five Usage, screenshot (html2canvas), lalu kirim base64 ke Railway. Tanpa Python/Selenium/debug port.
 // @author       diana
 // @match        https://gladius.telkom.co.id/*
@@ -18,8 +18,8 @@
   var RAILWAY_URL = "https://getembassybot-production.up.railway.app";
   var AGENT_SECRET = "njcdB4gEitPWyMSFVc58s388";
   var POLL_INTERVAL_DETIK = 10; // jeda polling antrian
-  var WAIT_HASIL_MS = 30000; // tunggu hasil "Cek Kualitas Jaringan" stabil
-  var WAIT_LFU_MS = 30000; // tunggu "Last Five Usage" selesai dimuat
+  var WAIT_HASIL_MS = 15000; // tunggu hasil "Cek Kualitas Jaringan" stabil
+  var WAIT_LFU_MS = 15000; // tunggu "Last Five Usage" selesai dimuat
   var SS_SCALE = 2; // kualitas screenshot (devicePixelRatio dibatasi)
 
   var DAFTAR_DOMAIN = ["apps.telkom", "telkom.net", "gold.telkom", "telkom.b2b"];
@@ -29,6 +29,57 @@
   var TEKS_TOMBOL_CEK = "Cek Kualitas Jaringan";
   var TEKS_TOMBOL_LFU = "Last Five Usage";
   // ====================================================================================
+
+  // ===================== STATE TOLERAN RELOAD (sessionStorage) =====================
+  // Halaman Gladius me-reload tiap klik Cek/LFU dan auto-refresh periodik. State di
+  // sessionStorage disimpan SEBELUM tiap langkah berisiko-reload; begitu script
+  // terbangun kembali sesudah reload, ia MELANJUTKAN dari langkah terakhir,
+  // bukan mengulang dari nol (mencegah loop klik->reload).
+  var STATE_KEY = "getembassy_state";
+  var HANDLED_KEY = "getembassy_handled";
+  var MAX_ATTEMPTS = 6;          // batas percobaan/reload per task
+  var STATE_TTL_MS = 6 * 60 * 1000;
+  var HANDLED_TTL_MS = 5 * 60 * 1000;
+
+  function simpanState(obj) {
+    try {
+      obj.ts = Date.now();
+      sessionStorage.setItem(STATE_KEY, JSON.stringify(obj));
+    } catch (e) {}
+  }
+
+  function bacaState() {
+    try {
+      var raw = sessionStorage.getItem(STATE_KEY);
+      if (!raw) return null;
+      var st = JSON.parse(raw);
+      if (!st || !st.id) return null;
+      if (Date.now() - st.ts > STATE_TTL_MS) { hapusState(); return null; }
+      return st;
+    } catch (e) { return null; }
+  }
+
+  function hapusState() {
+    try { sessionStorage.removeItem(STATE_KEY); } catch (e) {}
+  }
+
+  // id task yang SUDAH selesai dikirim — cegah duplikat bila auto-refresh menyusul.
+  function tandaiHandled(id) {
+    try {
+      var h = JSON.parse(sessionStorage.getItem(HANDLED_KEY) || "{}");
+      h[id] = Date.now();
+      var cut = Date.now() - HANDLED_TTL_MS;
+      Object.keys(h).forEach(function (k) { if (h[k] < cut) delete h[k]; });
+      sessionStorage.setItem(HANDLED_KEY, JSON.stringify(h));
+    } catch (e) {}
+  }
+
+  function sudahHandled(id) {
+    try {
+      var h = JSON.parse(sessionStorage.getItem(HANDLED_KEY) || "{}");
+      return !!h[id];
+    } catch (e) { return false; }
+  }
 
   function log(msg) {
     console.log("[GetEmbassy]", msg);
@@ -233,54 +284,144 @@
     });
   }
 
-  // ===================== PROSES 1 NOMOR (alur embassy.py) =====================
+  // ===================== PROSES 1 NOMOR (alur embassy.py, toleran reload) =====================
 
-  async function cekEmbassy(nomor) {
-    await tidur(600);
-    var hasil = { nomor: nomor, paket_ok: false, lfu_ok: false, domain_terpakai: null, foto: "" };
+  // Domain berikut yang BELUM dicoba (menghindari domain sama berulang saat resume).
+  function domainBerikutnya(st) {
+    var dicoba = {};
+    (st.coba || []).forEach(function (d) { dicoba[d.toLowerCase()] = true; });
+    var terpilih = (bacaDomainTerpilih() || "").toLowerCase();
+    if (terpilih) {
+      DAFTAR_DOMAIN.forEach(function (d) {
+        if (terpilih.indexOf(d) >= 0) dicoba[d.toLowerCase()] = true;
+      });
+    }
+    for (var i = 0; i < DAFTAR_DOMAIN.length; i++) {
+      var d = DAFTAR_DOMAIN[i];
+      if (!dicoba[d.toLowerCase()]) return d;
+    }
+    return null;
+  }
 
-    if (!isiNomor(nomor)) throw new Error("Kolom input Nomor Internet tidak ditemukan.");
-    if (!klikTeks(TEKS_TOMBOL_CEK, true)) throw new Error("Tombol '" + TEKS_TOMBOL_CEK + "' tidak ditemukan.");
-    await tungguTenang(WAIT_HASIL_MS);
-
+  // Setelah tombol "Cek" ditekan (inline ATAU resume pasca-reload): baca hasilnya.
+  async function lanjutDariCek(st) {
     var paket = bacaPaket();
     if (!paketKosong(paket)) {
-      hasil.paket_ok = true;
-      hasil.domain_terpakai = bacaDomainTerpilih() || null;
+      st.paket_ok = true;
+      st.domain = bacaDomainTerpilih() || null;
+      return lanjutKeLfu(st);
+    }
+
+    var domain = domainBerikutnya(st);
+    if (!domain) {
+      // SEMUA domain kosong → tetap kirim screenshot (tanpa Last Five Usage).
+      st.paket_ok = false;
+      return lanjutKeScreenshot(st);
+    }
+
+    st.coba.push(domain);
+    st.attempts++;
+    st.step = "cek";
+    simpanState(st);
+    setStatus("⚙️ " + st.nomor + " · coba domain " + domain);
+    if (pilihDomain(domain) && klikTeks(TEKS_TOMBOL_CEK, true)) {
+      await tungguTenang(WAIT_HASIL_MS);
+      // Bila klik tadi memicu reload, bagian ini mati → resume yang meneruskan.
+      return lanjutDariCek(bacaState() || st);
+    }
+    return lanjutDariCek(st);
+  }
+
+  // Paket sudah berisi → klik "Last Five Usage".
+  async function lanjutKeLfu(st) {
+    st.step = "lfu";
+    st.lfu_clicked = true;
+    st.lfu_ok = true;
+    simpanState(st);
+    setStatus("⚙️ " + st.nomor + " · Last Five Usage...");
+    if (klikTeks(TEKS_TOMBOL_LFU, true)) {
+      await tungguTenang(WAIT_LFU_MS);
+      // Bila klik memicu reload → mati di sini; resume 'lfu' langsung ke screenshot.
+      return lanjutKeScreenshot(bacaState() || st);
+    }
+    st.lfu_clicked = false;
+    return lanjutKeScreenshot(st);
+  }
+
+  async function lanjutKeScreenshot(st) {
+    setStatus("📸 Ambil screenshot " + st.nomor + " ...");
+    var foto = await ambilSS();
+    if (!foto) throw new Error("Screenshot kosong.");
+    var payload = {
+      id: st.id,
+      chat_id: st.chat_id,
+      message_id: st.message_id,
+      nomor: st.nomor,
+      foto: foto,
+      paket_ok: !!st.paket_ok,
+      lfu_ok: !!st.lfu_ok,
+      domain_terpakai: st.domain || null,
+      waktu: fmtWaktu(),
+    };
+    setStatus("📤 Kirim hasil " + st.nomor + " ...");
+    var resp = await kirimHasil(payload);
+    hapusState();
+    tandaiHandled(st.id);
+    if (resp && resp.ok && resp.sent) {
+      setStatus("✅ Selesai " + st.nomor);
+      log("Hasil " + st.nomor + " terkirim.");
     } else {
-      var dicoba = {};
-      var terpilih = (bacaDomainTerpilih() || "").toLowerCase();
-      if (terpilih) {
-        DAFTAR_DOMAIN.forEach(function (d) {
-          if (terpilih.indexOf(d) >= 0) dicoba[d] = true;
+      setStatus("🔴 Gagal kirim foto " + st.nomor);
+      log("Gagal kirim ke Railway: " + JSON.stringify(resp));
+    }
+  }
+
+  // Dipanggil saat script (baru) terbangun setelah reload — lanjut dari checkpoint.
+  async function cobaResumeSetelahReload() {
+    var st = bacaState();
+    if (!st) return false;
+    if (sudahHandled(st.id)) { hapusState(); return false; }
+    st.resume = (st.resume || 0) + 1;
+    simpanState(st);
+    if (st.attempts >= MAX_ATTEMPTS || st.resume >= MAX_ATTEMPTS) {
+      setStatus("🔴 Gagal (reload berulang) " + st.nomor);
+      log("Task " + st.id + " menyerah setelah banyak reload.");
+      try {
+        await laporGagal({
+          id: st.id, status: "gagal",
+          pesan: "Proses terulang karena halaman reload berulang.",
+          chat_id: st.chat_id, message_id: st.message_id, nomor: st.nomor,
         });
-      }
-      for (var i = 0; i < DAFTAR_DOMAIN.length; i++) {
-        var domain = DAFTAR_DOMAIN[i];
-        if (dicoba[domain]) continue;
-        dicoba[domain] = true;
-        setStatus("⚙️ " + nomor + " · coba domain " + domain);
-        if (!pilihDomain(domain)) continue;
-        if (!klikTeks(TEKS_TOMBOL_CEK, true)) continue;
-        await tungguTenang(WAIT_HASIL_MS);
-        paket = bacaPaket();
-        if (!paketKosong(paket)) {
-          hasil.paket_ok = true;
-          hasil.domain_terpakai = domain;
-          break;
-        }
-      }
+      } catch (e) {}
+      hapusState();
+      return true;
     }
-
-    if (hasil.paket_ok) {
-      setStatus("⚙️ " + nomor + " · Last Five Usage...");
-      if (klikTeks(TEKS_TOMBOL_LFU, true)) {
-        await tungguTenang(WAIT_LFU_MS);
-        hasil.lfu_ok = true;
+    idAktif = st.id;
+    lagiProses = true;
+    setStatus("↩️ Lanjut " + st.nomor + " (" + st.step + ")...");
+    try {
+      await tungguTenang(6000); // tunggu halaman baru render
+      if (st.step === "lfu") {
+        await lanjutKeScreenshot(st);
+      } else {
+        await lanjutDariCek(st);
       }
+    } catch (err) {
+      setStatus("🔴 Gagal lanjut " + st.nomor);
+      log("Resume gagal: " + err);
+      try {
+        await laporGagal({
+          id: st.id, status: "gagal", pesan: String(err).slice(0, 200),
+          chat_id: st.chat_id, message_id: st.message_id, nomor: st.nomor,
+        });
+      } catch (e) {}
+      hapusState();
+    } finally {
+      lagiProses = false;
+      idAktif = null;
+      updateTampilanAuto();
     }
-
-    return hasil;
+    return true;
   }
 
   function ambilSS() {
@@ -376,6 +517,7 @@
 
   var autoAktif = true;
   var lagiProses = false;
+  var idAktif = null;
   var statusEl = null, toggleBtn = null;
   var AUTO_KEY = "getembassy_auto_aktif";
 
@@ -432,7 +574,14 @@
   // ===================== LOOP UTAMA =====================
 
   async function prosesSatu(task) {
-    if (lagiProses || !autoAktif) return;
+    if (!autoAktif) return;
+    if (sudahHandled(task.id)) return;
+    var stateAda = bacaState();
+    if (stateAda) {
+      if (stateAda.id === task.id) return; // masih tengah diproses / diproses di-resume
+      hapusState();                        // state lama orphan → buang, mulai baru
+    }
+    idAktif = task.id;
     lagiProses = true;
     log("Proses antrian " + task.id + " nomor " + task.nomor);
     try {
@@ -445,34 +594,21 @@
         return;
       }
 
-      setStatus("⚙️ Proses " + task.nomor + " ...");
-      var hasil = await cekEmbassy(task.nomor);
-
-      setStatus("📸 Ambil screenshot " + task.nomor + " ...");
-      hasil.foto = await ambilSS();
-      if (!hasil.foto) throw new Error("Screenshot kosong.");
-
-      var payload = {
-        id: task.id,
-        chat_id: task.chat_id,
-        message_id: task.message_id,
-        nomor: hasil.nomor,
-        foto: hasil.foto,
-        paket_ok: !!hasil.paket_ok,
-        lfu_ok: !!hasil.lfu_ok,
-        domain_terpakai: hasil.domain_terpakai,
-        waktu: fmtWaktu(),
+      var st = {
+        id: task.id, nomor: task.nomor, chat_id: task.chat_id, message_id: task.message_id,
+        step: "cek", attempts: 0, resume: 0, coba: [], paket_ok: false, lfu_ok: false,
+        lfu_clicked: false, domain: null,
       };
+      simpanState(st);
 
-      setStatus("📤 Kirim hasil " + task.nomor + " ...");
-      var resp = await kirimHasil(payload);
-      if (resp && resp.ok && resp.sent) {
-        setStatus("✅ Selesai " + task.nomor);
-        log("Hasil " + task.nomor + " terkirim.");
-      } else {
-        setStatus("🔴 Gagal kirim foto " + task.nomor);
-        log("Gagal kirim ke Railway: " + JSON.stringify(resp));
-      }
+      setStatus("⚙️ Proses " + task.nomor + " ...");
+      if (!isiNomor(task.nomor)) throw new Error("Kolom input Nomor Internet tidak ditemukan.");
+      if (!klikTeks(TEKS_TOMBOL_CEK, true)) throw new Error("Tombol '" + TEKS_TOMBOL_CEK + "' tidak ditemukan.");
+      await tungguTenang(WAIT_HASIL_MS);
+
+      // Sampai di sini berarti klik TIDAK memicu reload → proses berlanjut inline.
+      // Kalau reload terjadi, script mati dan resume('cek') yang meneruskan.
+      await lanjutDariCek(bacaState() || st);
     } catch (err) {
       setStatus("🔴 Gagal proses " + task.nomor);
       log("Gagal: " + err);
@@ -482,8 +618,10 @@
           chat_id: task.chat_id, message_id: task.message_id, nomor: task.nomor,
         });
       } catch (e) {}
+      hapusState();
     } finally {
       lagiProses = false;
+      idAktif = null;
       updateTampilanAuto();
     }
   }
@@ -495,7 +633,10 @@
         if (items.length > 0) log("Antrian: " + items.length + " item");
         for (var i = 0; i < items.length; i++) {
           if (!autoAktif) break;
-          await prosesSatu(items[i]);
+          var it = items[i];
+          if (sudahHandled(it.id)) continue;
+          if (idAktif && it.id === idAktif) continue;
+          await prosesSatu(it);
           if (autoAktif) await tidur(1500);
         }
       } catch (err) {
@@ -521,14 +662,23 @@
 
   // ===================== PASANG =====================
 
-  function pasang() {
+  async function pasang() {
     buatUI();
     try {
       var tersimpan = localStorage.getItem(AUTO_KEY);
       if (tersimpan !== null) autoAktif = (tersimpan === "1");
     } catch (e) {}
     updateTampilanAuto();
-    if (autoAktif) mulaiLoop();
+    if (!autoAktif) return;
+
+    // Cek dulu: apakah ini kebangunan setelah reload di tengah proses?
+    // Jika ya, LANJUTKAN dari checkpoint (bukan mulai dari nol lagi).
+    try {
+      await cobaResumeSetelahReload();
+    } catch (e) {
+      log("Cek resume error: " + e);
+    }
+    mulaiLoop();
   }
 
   if (document.readyState === "loading") {
