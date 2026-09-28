@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Bot Telegram GetEmbassy (sisi Railway).
+"""Bot Telegram GetEmbassy (server bot).
+
+Bisa dijalankan di Railway maupun lokal (PC yang selalu nyala) — kodenya
+sama, hanya URL server bot di userscript yang berbeda.
 
 Menerima perintah dari user, mencatat permintaan cek Embassy atau Password
 Check ke antrian in-memory, lalu menyediakan endpoint HTTP publik yang
-ditanya-tanya oleh runner lokal (laptop PIC) yang memegang Chrome + Gladius.
+ditanya-tanya oleh UserScript Tampermonkey di Chrome yang memegang session
+login Gladius.
 
 Alur:
   /embassy <nomor>  -> tulis antrian + balas "Embassy: mengukur ..."
@@ -157,11 +161,19 @@ def _caption_hasil(nomor: str, waktu: str, paket_ok: bool, lfu_ok: bool) -> str:
     return caption
 
 
-def _caption_password(nomor: str, waktu: str, status: str) -> str:
+def _caption_password(
+    nomor: str, waktu: str, status: str, status_terbaca: bool, dialog: str
+) -> str:
     caption = f"Password Check {nomor} | {waktu}"
     status = str(status or "").strip()
-    if status:
+    if status and status_terbaca:
         caption += f"\nStatus: {status}"
+    elif str(dialog or "").strip():
+        caption += f'\nHalaman Gladius: "{str(dialog).strip()[:160]}"'
+    else:
+        # Jangan menulis "tidak ditemukan": data bisa saja ada, hanya belum ter-render
+        # saat screenshot diambil.
+        caption += "\nStatus belum terbaca saat diambil. Lihat fotonya."
     return caption[:1024]
 
 
@@ -169,11 +181,16 @@ def _caption_password(nomor: str, waktu: str, status: str) -> str:
 class _Handler(BaseHTTPRequestHandler):
     def _kirim(self, kode: int, obj) -> None:
         body = json.dumps(obj).encode("utf-8")
-        self.send_response(kode)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(kode)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            # Browser sudah menutup koneksi (mis. timeout/Gone). Respons tidak sampai,
+            # tapi hasil sudah terkirim ke Telegram -- jangan sampai thread handler mati.
+            logger.debug("Koneksi terputus saat mengirim respons (client sudah pergi).")
 
     def _sekret_ok(self) -> bool:
         qs = parse_qs(urlparse(self.path).query)
@@ -264,7 +281,13 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         if jenis == "password":
-            caption = _caption_password(nomor, waktu, status)
+            caption = _caption_password(
+                nomor,
+                waktu,
+                status,
+                bool(data.get("status_terbaca", True)),
+                str(data.get("dialog", "")),
+            )
         else:
             caption = _caption_hasil(nomor, waktu, paket_ok, lfu_ok)
         terkirim = _tele_post(

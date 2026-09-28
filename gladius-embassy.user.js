@@ -1,21 +1,99 @@
 // ==UserScript==
 // @name         GetEmbassy Gladius - Proses Otomatis
 // @namespace    http://tampermonkey.net/
-// @version      1.4.0
-// @description  [GetEmbassy] Auto-proses antrian /embassy dan /password dari bot Railway langsung di halaman Gladius: isi Nomor Internet, proses Embassy atau Password Check, ambil screenshot (html2canvas), lalu kirim base64 ke Railway. Tanpa Python/Selenium/debug port.
+// @version      1.5.0
+// @description  [GetEmbassy] Auto-proses antrian /embassy dan /password dari bot lokal/server langsung di halaman Gladius: isi Nomor Internet, proses Embassy atau Password Check, ambil screenshot (html2canvas), lalu kirim base64 ke server bot. Tanpa Python/Selenium/debug port.
 // @author       diana
 // @match        https://gladius.telkom.co.id/*
 // @grant        GM_xmlhttpRequest
+// @connect      127.0.0.1
 // @connect      getembassybot-production.up.railway.app
 // @require      https://html2canvas.hertzen.com/dist/html2canvas.min.js
-// @run-at       document-end
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
   "use strict";
 
-  // ===================== KONFIGURASI (edit sesuai .env / Railway) =====================
-  var RAILWAY_URL = "https://getembassybot-production.up.railway.app";
+  // ===================== NEUTRALISER DIALOG (WAJIB PALING AWAL) =====================
+  // Gladius memunculkan window.alert("... data tidak dapat ditemukan ...") saat hasil
+  // kosong. Dialog NATIVE membekukan SELURUH JavaScript halaman (setTimeout, promise,
+  // callback XHR) sampai diklik manual. Akibatnya script tidak bisa polling antrian
+  // dan membaca halaman yang belum selesai render. Dialog native tidak bisa ditutup
+  // dari JavaScript, jadi satu-satunya jalan adalah menggantinya SEBELUM script Gladius
+  // memanggilnya — karena itu blok ini harus jalan di document-start, di luar gate
+  // DOMContentLoaded.
+  var DIALOG_MAX = 20;
+  var DIALOG_LOG = [];
+  var DIALOG_TERAKHIR = null; // { pesan, waktu, jenis }
+
+  // Pola "data kosong" dari Gladius. Dipakai sebagai sinyal state, bukan ditebak dari isi sel.
+  var POLA_TIDAK_DITEMUKAN = new RegExp(
+    "tidak\\s+(dapat\\s+)?(di)?\\s*(t)?ditemukan" +
+    "|tdak\\s+(dapat\\s+)?ditemukan" +
+    "|belum\\s+ada" +
+    "|tidak\\s+ada" +
+    "|tidak\\s+tersedia" +
+    "|not\\s+found" +
+    "|no\\s+data",
+    "i"
+  );
+
+  function normTeks(s) { return String(s == null ? "" : s).replace(/\s+/g, " ").trim(); }
+
+  function catatDialog(pesan, jenis) {
+    DIALOG_TERAKHIR = { pesan: normTeks(pesan), waktu: Date.now(), jenis: jenis || "alert" };
+    DIALOG_LOG.push(DIALOG_TERAKHIR);
+    if (DIALOG_LOG.length > DIALOG_MAX) DIALOG_LOG.shift();
+    return DIALOG_TERAKHIR;
+  }
+
+  // true bila tidak ada dialog baru dalam jendela ms terakhir.
+  function dialogTua(ms) {
+    if (!DIALOG_TERAKHIR) return true;
+    return DIALOG_TERAKHIR.waktu <= Date.now() - (ms || 0);
+  }
+
+  // true bila dialog terakhir menyatakan data tidak ditemukan.
+  function dialogMenyatakanKosong() {
+    return !!(DIALOG_TERAKHIR && POLA_TIDAK_DITEMUKAN.test(DIALOG_TERAKHIR.pesan));
+  }
+
+  // Nilai yang terlalu panjang/berbentuk kalimat dianggap notifikasi, bukan nilai kolom.
+  function terlihatNotifikasi(t) {
+    t = normTeks(t);
+    if (!t) return false;
+    if (t.length > 60) return true;
+    return POLA_TIDAK_DITEMUKAN.test(t);
+  }
+
+  (function pasangDialogNonBlocking() {
+    try {
+      window.alert = function (pesan) {
+        catatDialog(pesan, "alert");
+        try { console.log("[GetEmbassy] alert dicegat:", pesan); } catch (e) {}
+        return undefined; // JANGAN panggil alert asli — itu yang membekukan halaman.
+      };
+      window.confirm = function (pesan) {
+        catatDialog(pesan, "confirm");
+        try { console.log("[GetEmbassy] confirm dicegat:", pesan); } catch (e) {}
+        return true; // agar alur Gladius tidak tersangkut menunggu pilihan
+      };
+      window.prompt = function (pesan, nilaiAwal) {
+        catatDialog(pesan, "prompt");
+        try { console.log("[GetEmbassy] prompt dicegat:", pesan); } catch (e) {}
+        return nilaiAwal == null ? "" : nilaiAwal;
+      };
+    } catch (e) {}
+  })();
+
+  // ===================== KONFIGURASI (edit sesuai .env / server bot) =====================
+  // SERVER_BOT = URL tempat bot.py berjalan.
+  //   Lokal  : "http://127.0.0.1:8080"   (PC yang sama dengan browser Gladius)
+  //   Railway: "https://getembassybot-production.up.railway.app"
+  // Wajib: host yang dipakai juga harus ada di @connect di metadata userscript.
+  var SERVER_BOT = "http://127.0.0.1:8080";
+  var RAILWAY_URL = SERVER_BOT; // alias lama (dipakai di seluruh file)
   var AGENT_SECRET = "njcdB4gEitPWyMSFVc58s388";
   var POLL_INTERVAL_DETIK = 10; // jeda polling antrian
   var WAIT_HASIL_MS = 15000; // tunggu hasil "Cek Kualitas Jaringan" stabil
@@ -27,7 +105,9 @@
   var SS_MASK_PASSWORD = true;
 
   var DAFTAR_DOMAIN = ["apps.telkom", "telkom.net", "gold.telkom", "telkom.b2b"];
-  var NILAI_PAKET_KOSONG = ["/", "-", "", "0", "n/a", "na", "kosong", "null", "none"];
+  // "0" sengaja TIDAK ada di sini: 0 bisa nilai asli. "Belum dimuat" dicatat terpisah
+  // lewat dialogMenyatakanKosong() supaya tidak tertukar dengan "kosong".
+  var NILAI_PAKET_KOSONG = ["/", "-", "", "n/a", "na", "kosong", "null", "none"];
   var TEKS_KOLOM_PAKET = "paket radius";
   var TEKS_KOLOM_PAKET_ALT = "paket pcrf";
   var TEKS_TOMBOL_CEK = "Cek Kualitas Jaringan";
@@ -237,48 +317,35 @@
     return "";
   }
 
+  // Baca nilai paket HANYA dari <tr> yang labelnya persis kolom paket, dan hanya dari sel
+  // tepat di sebelah kanannya. Versi lama menyisir div/span/li tanpa batas sehingga teks
+  // notifikasi ikut tertangkap -> paket_ok=true palsu -> LRU dikala halaman kosong.
   function bacaPaket() {
-    function norm(s) { return (s || "").replace(/\s+/g, " ").trim(); }
-    function esc(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
-    var kw = TEKS_KOLOM_PAKET, alt = TEKS_KOLOM_PAKET_ALT;
-    var pat = new RegExp("(?:" + esc(kw) + "|" + esc(alt) + ")", "i");
-    var seen = {};
-    var cells = document.querySelectorAll("td,th,div,span,label,li");
-    for (var i = 0; i < cells.length; i++) {
-      var el = cells[i];
-      var t = norm(el.innerText || el.textContent || "");
-      if (!t) continue;
-      var m = t.match(pat);
-      if (!m) continue;
-      var val = t.slice(m.index + m[0].length).replace(/^[\s:=\-]+/, "").trim();
-      var row = el.closest("tr");
-      if (row) {
-        var cs = row.querySelectorAll("td,th");
-        for (var k2 = 0; k2 < cs.length; k2++) {
-          if (cs[k2] === el && k2 + 1 < cs.length) {
-            var v2 = norm(cs[k2 + 1].innerText || cs[k2 + 1].textContent || "");
-            if (v2 && v2.length <= 60 && !seen[v2]) { seen[v2] = 1; return v2; }
-          }
-        }
+    if (dialogMenyatakanKosong()) return "";
+    var pat = new RegExp(
+      "^\\s*(?:" +
+      TEKS_KOLOM_PAKET.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "|" +
+      TEKS_KOLOM_PAKET_ALT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+      ")\\s*[:=-]?\\s*$",
+      "i"
+    );
+    var rows = document.querySelectorAll("tr");
+    for (var i = 0; i < rows.length; i++) {
+      var sel = rows[i].querySelectorAll("td,th");
+      for (var j = 0; j + 1 < sel.length; j++) {
+        var label = normTeks(sel[j].innerText || sel[j].textContent);
+        if (!pat.test(label)) continue;
+        var nilai = normTeks(sel[j + 1].innerText || sel[j + 1].textContent);
+        if (!nilai || terlihatNotifikasi(nilai)) return "";
+        if (nilaiKosong(nilai)) continue;
+        return nilai;
       }
-      var par = el.parentElement;
-      if (par && par !== el) {
-        var pt = norm(par.innerText || par.textContent || "");
-        if (pt.length > t.length) {
-          var pm = pt.match(pat);
-          if (pm) {
-            var pv = pt.slice(pm.index + pm[0].length).replace(/^[\s:=\-]+/, "").trim();
-            if (pv && pv.length <= 60 && !seen[pv]) { seen[pv] = 1; return pv; }
-          }
-        }
-      }
-      if (val && val.length <= 60 && !seen[val]) { seen[val] = 1; return val; }
     }
     return "";
   }
 
-  function paketKosong(nilai) {
-    nilai = String(nilai || "").trim().toLowerCase();
+  function nilaiKosong(nilai) {
+    nilai = normTeks(nilai).toLowerCase();
     return NILAI_PAKET_KOSONG.indexOf(nilai) >= 0;
   }
 
@@ -303,11 +370,11 @@
     };
   }
 
+  function esc(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
   // Area "hasil ukur" untuk screenshot: tabel hasil Embassy ("paket radius/pcrf")
   // + panel "Last Five Usage", ditambah sidebar/logo Gladius di kiri atas.
   function cariKotakHasil() {
-    function norm(s) { return (s || "").replace(/\s+/g, " ").trim(); }
-    function esc(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
     var kw = TEKS_KOLOM_PAKET, alt = TEKS_KOLOM_PAKET_ALT;
     var pat = new RegExp("(?:" + esc(kw) + "|" + esc(alt) + ")", "i");
     var patLfu = new RegExp(esc(TEKS_TOMBOL_LFU), "i");
@@ -315,7 +382,7 @@
     var semua = document.querySelectorAll("td,th,tr,div,span,label,table");
     for (var i = 0; i < semua.length; i++) {
       var el = semua[i];
-      var t = norm(el.innerText || el.textContent || "");
+      var t = normTeks(el.innerText || el.textContent || "");
       if (!t || t.length > 4000) continue;
       if (!t.match(pat) && !t.match(patLfu)) continue;
       var r = rectAbs(el);
@@ -334,16 +401,45 @@
     return box;
   }
 
-  function tungguTenang(kapurMs) {
+  // Tunggu sampai Gladius benar-benar selesai render, bukan sekadar "panjang teks tidak
+  // berubah ~1 detik" (versi lama resolve terlalu awal saat XHR masih berjalan).
+  // Syarat: tidak ada dialog membekukan halaman, tidak ada spinner/overlay loading, dan
+  // isi area hasil berubah dari snapshot sebelum aksi.
+  function adaSpinner() {
+    var sel = ".fa-spinner,.spinner,.loading,.loader,[class*='spinner'],[class*='loader'],[aria-busy='true']";
+    var els;
+    try { els = document.querySelectorAll(sel); } catch (e) { return false; }
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (el.offsetParent === null) continue;
+      var t = normTeks(el.innerText || el.textContent);
+      // Ignore decorative elements with no own text.
+      if (t && t.length > 80) continue;
+      return true;
+    }
+    return false;
+  }
+
+  function sidikJari() {
+    return normTeks(document.body ? (document.body.innerText || "") : "");
+  }
+
+  function tungguTenang(kapurMs, sebelum) {
     return new Promise(function (resolve) {
-      var akhir = Date.now() + kapurMs;
-      var prev = -1, stabil = 0;
+      var akhir = Date.now() + (kapurMs || 0);
+      var basis = sebelum == null ? null : normTeks(sebelum);
+      var stabil = 0;
       (function cek() {
-        var len = document.body ? (document.body.innerText || "").length : 0;
-        if (len === prev) stabil++; else stabil = 0;
-        prev = len;
-        if (stabil >= 2 || Date.now() >= akhir) { resolve(stabil >= 2); return; }
-        setTimeout(cek, 500);
+        var berubah = basis === null ? true : sidikJari() !== basis;
+        var bebas = dialogTua(1500) && !adaSpinner() && berubah;
+        if (bebas) {
+          stabil++;
+          if (stabil >= 2) { resolve(true); return; }
+        } else {
+          stabil = 0;
+        }
+        if (Date.now() >= akhir) { resolve(bebas || stabil >= 1); return; }
+        setTimeout(cek, 400);
       })();
     });
   }
@@ -436,7 +532,7 @@
     var parent = await tungguMenu(labels[0], 3000);
     if (parent) {
       try { parent.click(); } catch (e) {}
-      await tungguTenang(500);
+      await tungguTenang(800);
     }
     var child = await tungguMenu(labels[1], 5000);
     if (child) {
@@ -452,11 +548,15 @@
     var mulai = Date.now();
     var maks = jenis === "password" ? WAIT_PASSWORD_MS : WAIT_HASIL_MS;
     while (Date.now() - mulai < maks) {
-      var input = cariInput();
-      var tombol = jenis === "password"
-        ? (cariTeks(TEKS_TOMBOL_PASSWORD, true) || cariTeks("Cek", true))
-        : cariTeks(TEKS_TOMBOL_CEK, true);
-      if (input && tombol) return true;
+      // Jangan anggap form "siap" selagi dialog native masih membekukan halaman:
+      // elemen bisa terbaca ada, tapi kliknya tidak akan pernah dieksekusi.
+      if (dialogTua(1000)) {
+        var input = cariInput();
+        var tombol = jenis === "password"
+          ? (cariTeks(TEKS_TOMBOL_PASSWORD, true) || cariTeks("Cek", true))
+          : cariTeks(TEKS_TOMBOL_CEK, true);
+        if (input && tombol) return true;
+      }
       await wait(500);
     }
     return false;
@@ -484,24 +584,26 @@
   // Poll sel paket sampai terisi atau timeout (anti "fake empty": halaman hasil
   // Gladius kadang masih render saat resume, baca 1× bisa kelewat → LFU terlewat).
   function tungguHasilPaket(maxMs) {
-    maxMs = maxMs || 12000;
+    maxMs = maxMs || 30000;
     return new Promise(function (resolve) {
       var mulai = Date.now();
       (function poll() {
         var v = bacaPaket();
-        if (!paketKosong(v) || Date.now() - mulai >= maxMs) {
+        // Stops as soon as a real value is present, or when the page explicitly
+        // says the data does not exist (no point in waiting out the full timeout).
+        if (!nilaiKosong(v) || dialogMenyatakanKosong() || Date.now() - mulai >= maxMs) {
           resolve(v);
           return;
         }
-        setTimeout(poll, 1000);
+        setTimeout(poll, 500);
       })();
     });
   }
 
   // Setelah tombol "Cek" ditekan (inline ATAU resume pasca-reload): baca hasilnya.
   async function lanjutDariCek(st) {
-    var paket = await tungguHasilPaket(12000);
-    if (!paketKosong(paket)) {
+    var paket = await tungguHasilPaket(30000);
+    if (!nilaiKosong(paket)) {
       st.paket_ok = true;
       st.domain = bacaDomainTerpilih() || null;
       return lanjutKeLfu(st);
@@ -520,7 +622,7 @@
     simpanState(st);
     setStatus("⚙️ " + st.nomor + " · coba domain " + domain);
     if (pilihDomain(domain) && klikTeks(TEKS_TOMBOL_CEK, true)) {
-      await tungguTenang(WAIT_HASIL_MS);
+      await tungguTenang(WAIT_HASIL_MS, sidikJari());
       // Bila klik tadi memicu reload, bagian ini mati → resume yang meneruskan.
       return lanjutDariCek(bacaState() || st);
     }
@@ -544,7 +646,13 @@
     return null;
   }
 
+  // Status tidak terbaca TIDAK lagi ditulis sebagai kalimat "tidak ditemukan" karena
+  // ikut masuk ke caption Telegram dan menyesatkan (data sebenarnya ada, hanya belum
+  // ter-render). Sekarang dikembalikan "" + flag terpisah.
+  var STATUS_PW_TERBACA = false;
+
   function bacaStatusPassword() {
+    STATUS_PW_TERBACA = false;
     var labels = ["status password", "password status", "status pelanggan", "status"];
     var tables = document.querySelectorAll("table");
     for (var ti = 0; ti < tables.length; ti++) {
@@ -564,32 +672,47 @@
           for (var ri = hi + 1; ri < trs.length; ri++) {
             var dataCells = trs[ri].querySelectorAll("td");
             var statusValue = dataCells[h] ? teksEl(dataCells[h]) : "";
-            if (statusValue) return statusValue.slice(0, 200);
+            if (statusValue && !terlihatNotifikasi(statusValue)) {
+              STATUS_PW_TERBACA = true;
+              return statusValue.slice(0, 200);
+            }
           }
         }
       }
     }
     var el = cariElemenStatusPassword();
-    if (!el) return "Status tidak ditemukan";
+    if (!el) return "";
     var row = el.closest("tr");
     if (row) {
       var cells = row.querySelectorAll("td, th");
       for (var i = 0; i < cells.length; i++) {
         if (cells[i] === el && i + 1 < cells.length) {
           var value = teksEl(cells[i + 1]);
-          if (value) return value.slice(0, 200);
+          if (value && !terlihatNotifikasi(value)) {
+            STATUS_PW_TERBACA = true;
+            return value.slice(0, 200);
+          }
         }
       }
     }
     var sibling = el.nextElementSibling;
     if (sibling) {
       var siblingText = teksEl(sibling);
-      if (siblingText && siblingText.length <= 200) return siblingText;
+      if (siblingText && siblingText.length <= 200 && !terlihatNotifikasi(siblingText)) {
+        STATUS_PW_TERBACA = true;
+        return siblingText;
+      }
     }
     var text = teksEl(el);
     var match = text.match(/status(?:\s+(?:password|pelanggan))?\s*[:\-]\s*(.+)$/i);
-    if (match && match[1]) return match[1].trim().slice(0, 200);
-    return "Status tidak terbaca";
+    if (match && match[1]) {
+      var mv = match[1].trim();
+      if (!terlihatNotifikasi(mv)) {
+        STATUS_PW_TERBACA = true;
+        return mv.slice(0, 200);
+      }
+    }
+    return "";
   }
 
   function maskPasswordValues() {
@@ -648,6 +771,7 @@
   }
 
   async function lanjutPassword(st) {
+    var basis = sidikJari();
     if (st.step === "password_cek") {
       setStatus("⚙️ Password check " + st.nomor + " ...");
       if (!isiNomor(st.nomor)) throw new Error("Kolom input Nomor Internet tidak ditemukan.");
@@ -657,14 +781,50 @@
       if (!klikTeks(TEKS_TOMBOL_PASSWORD, true)) {
         throw new Error("Tombol '" + TEKS_TOMBOL_PASSWORD + "' tidak ditemukan.");
       }
-      await tungguTenang(WAIT_PASSWORD_MS);
+      await tungguTenang(WAIT_PASSWORD_MS, basis);
     } else {
-      await tungguTenang(WAIT_PASSWORD_MS);
+      await tungguTenang(WAIT_PASSWORD_MS, basis);
     }
-    st.status = bacaStatusPassword();
+    // Tabel status sering menyusul beberapa detik setelah render utama; beri kesempatan
+    // kedua supaya tidak terbaca kosong lalu langsung difoto.
+    var status = bacaStatusPassword();
+    if (!status && !dialogMenyatakanKosong()) {
+      await wait(2000);
+      status = bacaStatusPassword();
+    }
+    st.status = status;
+    st.status_terbaca = STATUS_PW_TERBACA;
     st.step = "password_screenshot";
     simpanState(st);
     return lanjutKeScreenshot(st);
+  }
+
+  // Konfirmasi panel Last Five Usage benar-benar terbuka. Versi lama menulis
+  // lfu_ok=true hanya karena tombolnya diklik, padahal panelnya tidak pernah muncul —
+  // itu sebabnya caption bilang LFU gagal padahal tidak, atau sebaliknya.
+  function lfuSudahTerbuka() {
+    if (dialogMenyatakanKosong()) return false;
+    var pat = new RegExp(TEKS_TOMBOL_LFU.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    var semua = document.querySelectorAll("table,div,section,ul,ol");
+    var bukti = 0;
+    for (var i = 0; i < semua.length; i++) {
+      var el = semua[i];
+      if (el.offsetParent === null) continue;
+      var t = normTeks(el.innerText || el.textContent);
+      if (!t || t.length > 4000) continue;
+      if (!pat.test(t)) continue;
+      // Panel LFU dianggap terbuka bila ada isi tabel/baris di dalamnya yang bukan
+      // sekadar tombol dan bukan teks "tidak ditemukan".
+      var isi = el.querySelectorAll("table tr, ul li, ol li");
+      for (var j = 0; j < isi.length; j++) {
+        var baris = normTeks(isi[j].innerText || isi[j].textContent);
+        if (!baris || baris.length > 300) continue;
+        if (pat.test(baris) && baris.length < 40) continue; // ini tombolnya, bukan isi
+        if (terlihatNotifikasi(baris)) continue;
+        bukti++;
+      }
+    }
+    return bukti > 0;
   }
 
   // Paket sudah berisi → klik "Last Five Usage".
@@ -677,8 +837,8 @@
     if (klikTeks(TEKS_TOMBOL_LFU, true)) {
       st.lfu_clicked = true;
       simpanState(st);
-      await tungguTenang(WAIT_LFU_MS);
-      st.lfu_ok = true;
+      await tungguTenang(WAIT_LFU_MS, sidikJari());
+      st.lfu_ok = lfuSudahTerbuka();
       simpanState(st);
       // Bila klik memicu reload → mati di sini; resume 'lfu' akan klik ulang lagi.
       return lanjutKeScreenshot(bacaState() || st);
@@ -691,6 +851,17 @@
   }
 
   async function lanjutKeScreenshot(st) {
+    // Baca ulang state tepat sebelum foto. Gladius kerap merender beberapa detik
+    // setelah langkah sebelumnya, jadi caption dan foto harus berasal dari bacaan
+    // yang sama — inilah penyebab lama caption "tidak ditemukan" padahal fotonya berisi data.
+    if (st.jenis === "embassy" && !st.paket_ok) {
+      var p = bacaPaket();
+      if (!nilaiKosong(p)) {
+        st.paket_ok = true;
+        st.domain = bacaDomainTerpilih() || st.domain || null;
+      }
+    }
+
     setStatus("📸 Ambil screenshot " + st.nomor + " ...");
     var foto = await ambilSS(st.jenis);
     if (!foto) throw new Error("Screenshot kosong.");
@@ -701,6 +872,8 @@
       nomor: st.nomor,
       jenis: st.jenis || "embassy",
       status: st.status || "",
+      status_terbaca: st.status_terbaca !== false,
+      dialog: DIALOG_TERAKHIR ? DIALOG_TERAKHIR.pesan.slice(0, 200) : "",
       foto: foto,
       paket_ok: !!st.paket_ok,
       lfu_ok: !!st.lfu_ok,
@@ -716,7 +889,7 @@
       log("Hasil " + st.nomor + " terkirim.");
     } else {
       setStatus("🔴 Gagal kirim foto " + st.nomor);
-      log("Gagal kirim ke Railway: " + JSON.stringify(resp));
+      log("Gagal kirim ke server bot: " + JSON.stringify(resp));
     }
   }
 
@@ -814,8 +987,20 @@
           box.bottom = Math.min(h, Math.ceil(box.bottom));
         }
       }
-      if (!box) box = { left: 0, top: 0, right: w, bottom: h };
-      try { window.scrollTo(0, box.top); } catch (e) {}
+    if (!box) box = { left: 0, top: 0, right: w, bottom: h };
+    // Dialog native membekukan halaman; html2canvas butuh event loop bebas supaya tidak
+    // menghasilkan canvas setengah jadi (halaman tampak utuh tapi banyak area putih).
+    if (!dialogTua(500)) {
+      return new Promise(function (r) {
+        var n = 0;
+        (function tunggu() {
+          if (dialogTua(500) || n > 30) { r(); return; }
+          n++;
+          setTimeout(tunggu, 500);
+        })();
+      }).then(function () { return ambilSS(jenis); });
+    }
+    try { window.scrollTo(0, box.top); } catch (e) {}
       window.html2canvas(document.body, {
         useCORS: true,
         allowTaint: false,
@@ -839,7 +1024,7 @@
     });
   }
 
-  // ===================== KOMUNIKASI DENGAN RAILWAY =====================
+  // ===================== KOMUNIKASI DENGAN SERVER BOT =====================
 
   function reqGM(opt) {
     return new Promise(function (resolve) {
@@ -878,6 +1063,11 @@
     }
   }
 
+  // Timeout dibuat jauh di atas durasi unggah bot (bot.py pakai requests timeout=120).
+  // Nilai lama 30s pasti kalah untuk foto besar -> ConnectionAbortedError -> badge
+  // "Gagal kirim" padahal foto sudah sampai ke Telegram.
+  var KIRIM_TIMEOUT_MS = 180000;
+
   async function kirimHasil(payload) {
     var url = RAILWAY_URL + "/kirim?secret=" + encodeURIComponent(AGENT_SECRET);
     var res = await reqGM({
@@ -885,7 +1075,7 @@
       url: url,
       data: JSON.stringify(payload),
       headers: { "Content-Type": "application/json" },
-      timeout: 30000,
+      timeout: KIRIM_TIMEOUT_MS,
     });
     try { return JSON.parse(res.body); }
     catch (e) { return { ok: false }; }
@@ -1004,8 +1194,9 @@
         await lanjutPassword(st);
       } else {
         if (!isiNomor(task.nomor)) throw new Error("Kolom input Nomor Internet tidak ditemukan.");
+        var basisCek = sidikJari();
         if (!klikTeks(TEKS_TOMBOL_CEK, true)) throw new Error("Tombol '" + TEKS_TOMBOL_CEK + "' tidak ditemukan.");
-        await tungguTenang(WAIT_HASIL_MS);
+        await tungguTenang(WAIT_HASIL_MS, basisCek);
         await lanjutDariCek(bacaState() || st);
       }
     } catch (err) {
