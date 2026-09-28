@@ -19,21 +19,23 @@ if not TOKEN:
         "atau set environment variable TELEGRAM_BOT_TOKEN."
     )
 
-# ==================== RELAY RAILWAY <-> AGENT LOKAL ====================
-# URL publik bot di Railway (dipakai agent lokal untuk menanyakan antrian).
+# ==================== RELAY SERVER BOT <-> USERSCRIPT ====================
+# URL server bot. Saat lokal TIDAK dipakai (userscript memakai 127.0.0.1:8080);
+# hanya agent.py lama (Selenium) yang membacanya. Railway: isi bila deploy di sana.
 RAILWAY_URL = os.getenv("RAILWAY_URL", "").strip().rstrip("/")
 
-# Kata kunci rahasia antara bot (Railway) dan agent lokal.
+# Kata kunci rahasia antara bot server dan userscript/agent.
 AGENT_SECRET = os.getenv("AGENT_SECRET", "").strip()
 
-# Agent lokal meminta antrian tiap N detik.
+# Agent lokal (jalur lama) meminta antrian tiap N detik.
 AGENT_INTERVAL_DETIK = int(os.getenv("AGENT_INTERVAL_DETIK", "10"))
 
 # Jika antrian pending tidak diproses agent dalam N menit, bot meng-edit pesan
 # status menjadi "Server Gladius tidak tersambung".
 WAIT_ANNOUNCE_MENIT = int(os.getenv("WAIT_ANNOUNCE_MENIT", "3"))
 
-# Port HTTP endpoint (Railway menyuntikkan $PORT; default 8080).
+# Port HTTP endpoint (Railway menyuntikkan $PORT; default 8080 juga dipakai
+# saat berjalan lokal, dan harus sama dengan SERVER_BOT di userscript).
 PORT_HTTP = int(os.getenv("PORT", "8080"))
 
 # ==================== SELENIUM (dipakai AGENT LOKAL) ====================

@@ -2,7 +2,12 @@ __pycache__/
 *.pyc
 .env
 outputs/
+logs/
 desktop.ini
 *.jpg
 *.png
 chrome-profile/
+
+# Berisi URL deployment Google Apps Script (idAKfyc...) yang akan jadi publik
+# kalau ikut ter-commit. Simpan lokal saja.
+insera-sync-DEV.user.js

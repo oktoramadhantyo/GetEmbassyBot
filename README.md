@@ -2,7 +2,9 @@
 
 Bot Telegram untuk memeriksa nomor Embassy atau Password Check di Web Gladius dan mengirim 1 screenshot hasilnya ke user Telegram.
 
-Arsitektur: **bot di Railway (online 24 jam) + UserScript Tampermonkey di browser laptop PIC** (yang memegang session login Gladius). Tidak perlu Python lokal / Selenium / Chrome debug port. UserScript menanya antrian ke Railway via HTTP, memproses Embassy atau Password Check langsung di dalam halaman Gladius, lalu mengirim screenshot (html2canvas) kembali ke Railway untuk dikirim ke user.
+Arsitektur: **bot.py di server + UserScript Tampermonkey di browser PIC** (yang memegang session login Gladius). UserScript menanya antrian ke server bot via HTTP, memproses Embassy atau Password Check langsung di dalam halaman Gladius, lalu mengirim screenshot (html2canvas) kembali ke server bot untuk dikirim ke user.
+
+> **Status sekarang: dijalankan LOKAL.** `bot.py` jalan di PC yang sama dengan browser Gladius (`http://127.0.0.1:8080`), jadi tidak ada biaya hosting, tidak ada sleep/cold-start. Kode `bot.py` tidak berubah sama sekali — hanya URL di userscript yang berbeda. Kalau nanti mau pindah ke Railway, cukup ganti `SERVER_BOT` di `gladius-embassy.user.js` (dan tambahkan host-nya ke `@connect`).
 
 ## Arsitektur
 
@@ -10,7 +12,7 @@ Arsitektur: **bot di Railway (online 24 jam) + UserScript Tampermonkey di browse
 [User Telegram]
      │  /embassy 121519246796 atau /password 121519246796
      ▼
-[RAILWAY: bot.py]  (PTB polling + HTTP endpoint mini)
+[SERVER BOT: bot.py]  (PTB polling + HTTP endpoint mini)
      │  catat antrian di RAM          ▲──── daemon 24 jam
      ▼                                 │
 [GET /antrian?secret=...]──────┐       │
@@ -20,7 +22,7 @@ Arsitektur: **bot di Railway (online 24 jam) + UserScript Tampermonkey di browse
      │  → isi nomor → Cek Kualitas Jaringan / Password Check
      │    → proses sesuai jenis → screenshot
      │  → screenshot html2canvas → base64
-     ├── POST /kirim?secret=... (foto + caption → Railway kirim ke user)
+     ├── POST /kirim?secret=... (foto + caption → server kirim ke user)
      └── POST /selesai?secret=... (laporan gagal jika perlu)
 ```
 
@@ -48,7 +50,8 @@ Silakan dicoba lagi nanti.
 ```
 Projek Magang-GetEmbassy/
 ├── README.md
-├── bot.py                    # sisi RAILWAY: PTB polling + antrian + HTTP /antrian /kirim /selesai /health
+├── bot.py                    # SERVER BOT: PTB polling + antrian + HTTP /antrian /kirim /selesai /health
+├── start_bot.bat             # (lokal) jalankan bot.py + auto-restart + tulis logs/bot.log
 ├── agent.py                  # (LAMA, opsional) agent Selenium lokal
 ├── config.py                 # konfigurasi pusat via .env
 ├── gladius-embassy.user.js   # UserScript Tampermonkey di Chrome PIC — proses Embassy/Password Check
@@ -58,10 +61,11 @@ Projek Magang-GetEmbassy/
 ├── requirements.txt
 ├── .env.example              # template .env
 ├── .env                      # (gitignored) token & setting
-├── Procfile                  # web: python bot.py
+├── Procfile                  # web: python bot.py  (hanya dipakai kalau deploy di Railway)
 ├── start_agent.bat           # (LAMA, opsional) auto Chrome debug + run agent lama
 ├── Screenshot 2026-09-22 125002.png
-└── outputs/                  # hasil screenshot (gitignored)
+├── outputs/                  # hasil screenshot (gitignored)
+└── logs/                     # log bot lokal (gitignored)
 ```
 
 ## Teknologi
@@ -69,7 +73,7 @@ Projek Magang-GetEmbassy/
 - Python 3.13
 - `python-telegram-bot` (polling)
 - `selenium` (agent lokal, attach ke Chrome yang sudah login — pola BotInsera)
-- `requests` (agent → Telegram Bot API & Railway)
+- `requests` (agent → Telegram Bot API & relay foto)
 - `python-dotenv`
 
 ## Setup & Cara Menjalankan
@@ -86,29 +90,65 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-Isi: `TELEGRAM_BOT_TOKEN`, `RAILWAY_URL`, `AGENT_SECRET`.
+Isi minimal untuk lokal: `TELEGRAM_BOT_TOKEN` + `AGENT_SECRET`. `RAILWAY_URL` tidak dipakai saat lokal.
 
-### 3. Deploy bot (Railway)
+### 3. Jalankan bot (lokal)
+
+Cukup dobel-klik **`start_bot.bat`**. File itu akan:
+
+- menjalankan `python bot.py`,
+- menulis semua output ke `logs\bot.log`,
+- **menyalakan ulang otomatis** kalau bot crash atau ditutup paksa (delay 5 detik),
+- menolak start kalau ternyata sudah ada bot yang jalan di port 8080 (mencegah konflik `getUpdates`).
+
+Atau jalankan manual kalau sedang mau lihat log langsung di layar:
+
+```bat
+cd /d "C:\Users\diana\Downloads\MAGANGG\Projek Magang-GetEmbassy"
+python bot.py
+```
+
+Cek bot hidup: buka `http://127.0.0.1:8080/health` di browser → harusnya `{"ok": true}`.
+
+Untuk berhenti: tutup jendela `start_bot.bat`, atau `Ctrl+C` lalu `Y`.
+
+#### Supaya bot nyala sendiri setelah PC restart
+
+1. Nonaktifkan sleep/hibernate di **Settings → System → Power & battery** (PC tidak boleh tidur).
+2. **Task Scheduler** → **Create Task**:
+   - Trigger: *At startup*
+   - Action: browse ke `start_bot.bat` di folder proyek ini
+   - Centang **"Run whether user is logged on or not"**
+   - Tab Settings → centang **"If the task fails, restart every 1 minute"**
+3. Kalau dipindah ke PC lain, jalankan ulang `regasm`/sesuaikan Working Directory-nya.
+
+#### Kalau botnya di PC berbeda dari browser
+
+- `bot.py` sudah bind `0.0.0.0`, tapi butuh **firewall rule buka port 8080** di PC server.
+- Pakai **IP LAN statis** (DHCP reservation di router), supaya URL userscript tidak berubah-ubah.
+- Di userscript, set `SERVER_BOT = "http://192.168.x.x:8080"` **dan** tambahkan `@connect 192.168.x.x`.
+
+### 3b. Deploy bot (Railway, opsional)
+
+Kalau nanti mau pindah ke Railway:
 
 1. Push repo ke GitHub.
 2. Railway → **New Project → Deploy from GitHub** → pilih repo `GetEmbassyBot`.
-3. Set **Variables**:
-   - `TELEGRAM_BOT_TOKEN`
-   - `AGENT_SECRET` (nilai diterima spesifik SAMA dengan `.env` agent)
-   - `WAIT_ANNOUNCE_MENIT` (opsional)
-4. Railway otomatis mendeteksi `Procfile` (`web: python bot.py`) dan mengekspos URL publik, misal `https://getembassybot.up.railway.app`.
-5. Salin URL itu ke `RAILWAY_URL` (di `.env` dan di konfigurasi userscript).
-6. Cek endpoint di browser: `https://<url>.up.railway.app/health` → `{"ok": true}`.
+3. Set **Variables**: `TELEGRAM_BOT_TOKEN`, `AGENT_SECRET`, `WAIT_ANNOUNCE_MENIT` (opsional).
+4. Railway membaca `Procfile` (`web: python bot.py`) dan mengekspos URL publik.
+5. Di userscript, set `SERVER_BOT` ke URL itu **dan** tambahkan host-nya ke `@connect`.
+6. Cek `https://<url>.up.railway.app/health` → `{"ok": true}`.
 
-> Catatan: `PORT` di-inject otomatis oleh Railway; batas `WAIT_ANNOUNCE_MENIT` untuk announce "tidak tersambung".
+> Railway menyuntikkan `PORT` sendiri. Pastikan **tidak** ada bot lokal yang masih jalan, karena akan konflik `getUpdates`.
 
-### 4. Pasang UserScript Tampermonkey (laptop PIC)
+### 4. Pasang UserScript Tampermonkey (browser PIC)
 
 1. Pasang ekstensi **Tampermonkey** di Chrome.
 2. Buat script baru → tempel isi `gladius-embassy.user.js`.
 3. Sesuaikan bagian **KONFIGURASI** di atas file:
-   - `RAILWAY_URL` = URL bot di Railway.
-   - `AGENT_SECRET` = sama persis dengan value di Railway/`.env`.
+   - `SERVER_BOT` = URL server bot. Lokal (PC sama): `http://127.0.0.1:8080`.
+   - `AGENT_SECRET` = sama persis dengan value di `.env`.
+   - **Host yang dipakai juga harus terdaftar di `@connect`** (baris paling atas file). Ini wajib — kalau tidak, polling gagal diam-diam tanpa error yang kelihatan.
    - `SS_CROP = "auto"` = screenshot di-crop ke area hasil ukur saja (sidebar/logo Gladius + tabel hasil + Last Five Usage), `SS_SCALE` = tingkat kecil/besar (default `1`). Kalau auto-crop kurang pas, isi `SS_CROP_OVERRIDE` mis. `{left: 0, top: 0, right: 1400, bottom: 2100}` untuk angka pasti.
 4. Buka halaman Gladius → **login** → biarkan tab ini selalu terbuka. Bot dapat membuka halaman Embassy atau Password Check sesuai permintaan.
 5. Pastikan badge **🟢 GetEmbassy: idle** muncul di bawah kanan. Klik tombol `ON`/`OFF` untuk menyalakan atau mematikan.
@@ -140,17 +180,28 @@ python -m scraper.embassy 121519246796 --dump
 
 Selector halaman Gladius belum terdokumentasi; elemen dicari toleran berdasarkan teks ("Cek Kualitas Jaringan", "Password Check", "Last Five Usage"), input Nomor Internet, navigasi menu, `<select>` dropdown domain (heuristik opsi bertanda titik), dan kolom paket/status. Divalidasi saat test langsung — jika tidak cocok, hasil dump di atas membantu menyesuaikan.
 
+## Catatan Penting Mode Lokal
+
+- **Queue bot ada di RAM.** Kalau `bot.py` mati (PC restart, crash, battery habis) saat ada antrian aktif, task itu hilang dan pesan user menggantung di "mengukur…" tanpa pernah diedit jadi gagal. Task yang belum diproses tidak akan dilanjutkan setelah bot start ulang.
+- **PC harus tidak tidur.** Kalau PC sleep, bot mati dan `/status` tidak akan dijawab.
+- **Jangan jalan 2 instance.** `python bot.py` yang dobel-dobel akan konflik di `getUpdates` Telegram. `start_bot.bat` sudah cek `/health` dulu untuk mencegahnya, tapi kalau kamu jalankan `python bot.py` manual bersamaan dengan `.bat`, penjaga itu tidak berlaku.
+- **Satu titik gagal.** benefitnya: tidak ada server lain yang bisa mati. Di Railway/Render/HF, ada 3 titik (PC PIC + provider + service). Di lokal, hanya 1 — tapi itu juga artinya kalau PC-nya mati, bot langsung mati.
+- **Log.** Semua output ada di `logs\bot.log`. Kalau bot tiba-tiba tidak merespons, cek file ini dulu — biasanya ada traceback di baris terakhir.
+- **Secret.** `AGENT_SECRET` ada di dalam `gladius-embassy.user.js`. Repo GitHub-nya public, jadi kalau nanti dipakai lewat IP LAN atau deploy publik, putar nilai `AGENT_SECRET` ini sekali (ganti di userscript + `.env` + Railway Variables).
+
 ## Progress / Checklist
 
 - [x] Deskripsi alur bot & pesan output
 - [x] Konfirmasi URL + cara masuk Web Gladius
 - [x] Handler `/embassy <nomor>` dan `/password <nomor>`
 - [x] Announcement "Server Gladius tidak tersambung" + `/status`
-- [x] Arsitektur Railway + agent (awalnya agent lokal, lihat bawah)
+- [x] Arsitektur server bot + agent (awalnya agent lokal, lihat bawah)
 - [x] Scraper pencarian nomor embassy di Web Gladius
 - [x] Screenshot hasil Embassy/Password Check (1 gambar; nilai password dimasker)
 - [x] Penanganan gagal riwayat → tetap kirim screenshot Embassy
 - [x] UserScript Tampermonkey `gladius-embassy.user.js` (ganti agent Python-lokal: polling `/antrian`, proses di halaman, html2canvas screenshot, kirim ke `/kirim`)
-- [x] Railway endpoint `/kirim` (relay foto base64 → sendPhoto + edit pesan) & `/selesai` (edit pesan gagal)
-- [ ] Test end-to-end via Telegram: pasang userscript di Chrome PIC, kirim `/embassy <nomor>` atau `/password <nomor>`, validasi navigasi/selector/screenshot (html2canvas — ingat risiko iframe)
-- [ ] Deploy Railway versi baru (dengan `/kirim`) + jalankan browser PIC dengan userscript aktif
+- [x] Endpoint `/kirim` (relay foto base64 → sendPhoto + edit pesan) & `/selesai` (edit pesan gagal)
+- [x] Pindah ke mode lokal: `start_bot.bat` + `SERVER_BOT` = `127.0.0.1:8080`
+- [ ] Daftarkan `start_bot.bat` ke Task Scheduler (auto-start setelah PC restart)
+- [ ] Test end-to-end via Telegram: jalankan bot, pasang userscript di Chrome, kirim `/embassy <nomor>`, validasi navigasi/selector/screenshot (html2canvas — ingat risiko iframe)
+- [ ] Auto-start diuji (restart PC → bot harus up sendiri)
