@@ -30,6 +30,7 @@ import base64
 import io
 import json
 import logging
+import os
 import re
 import threading
 from datetime import datetime
@@ -436,8 +437,11 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("embassy", cmd_embassy))
     app.add_handler(CommandHandler("password", cmd_password))
-    logger.info("Bot GetEmbassy jalan - poll status...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Bot GetEmbassy jalan (PID %d) - poll status...", os.getpid())
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    except KeyboardInterrupt:
+        logger.info("Bot dihentikan lewat Ctrl+C.")
 
 
 if __name__ == "__main__":

@@ -97,11 +97,12 @@ Isi minimal untuk lokal: `TELEGRAM_BOT_TOKEN` + `AGENT_SECRET`. `RAILWAY_URL` ti
 Cukup dobel-klik **`start_bot.bat`**. File itu akan:
 
 - menjalankan `python bot.py`,
-- menulis semua output ke `logs\bot.log`,
-- **menyalakan ulang otomatis** kalau bot crash atau ditutup paksa (delay 5 detik),
+- menampilkan log di jendela CMD **sekaligus** menyalinnya ke `logs\bot.log`,
+- merotasi log lama ke `logs\bot-prev.log` setiap kali dijalankan,
+- **menanyakan** apakah mau dinyalakan ulang saat bot berhenti (jawab `N` untuk berhenti),
 - menolak start kalau ternyata sudah ada bot yang jalan di port 8080 (mencegah konflik `getUpdates`).
 
-Atau jalankan manual kalau sedang mau lihat log langsung di layar:
+Atau jalankan manual kalau mau log langsung di layar tanpa pencatatan:
 
 ```bat
 cd /d "C:\Users\diana\Downloads\MAGANGG\Projek Magang-GetEmbassy"
@@ -110,7 +111,7 @@ python bot.py
 
 Cek bot hidup: buka `http://127.0.0.1:8080/health` di browser → harusnya `{"ok": true}`.
 
-Untuk berhenti: tutup jendela `start_bot.bat`, atau `Ctrl+C` lalu `Y`.
+Untuk berhenti: tekan `Ctrl+C` di jendela `start_bot.bat`, lalu jawab `N` saat ditanya "Jalankan ulang otomatis?". Kalau Windows menampilkan "Terminate batch job (Y/N)?", jawab `Y`. Untuk berhenti permanen tanpa ditanya lagi, buat file kosong `logs\STOP` — saat bot berhenti, launcher melihat sentinel itu dan tidak menyalakan ulang.
 
 #### Supaya bot nyala sendiri setelah PC restart
 
@@ -155,7 +156,7 @@ Kalau nanti mau pindah ke Railway:
 
 > Satu user/PIC harus menjaga tab Chrome ini tetap menyala + login agar robot bisa dipakai. Tidak perlu Python/Selenium/debug port lagi. Jika tab mati, bot otomatis menginfokan "Server Gladius tidak tersambung".
 >
-> **Catatan reload:** halaman Gladius memang me-reload tiap kali tombol Cek/Last Five diklik dan kadang auto-refresh sendiri. Script menoleransi itu — ia menyimpan checkpoint per langkah dan **melanjutkan dari langkah terakhir** setelah reload (badge akan menunjuk `↩️ Lanjut <nomor> ...`), bukan mengulang dari nol. Karena refresh selalu menutup kembali panel "Last Five Usage", pada resume step `lfu` tombol LFU **diklik ulang** sebelum screenshot biar hasilnya tetap memuat tabel Last Five Usage.
+> **Catatan reload:** halaman Gladius memang me-reload tiap kali tombol Cek/Last Five diklik dan kadang auto-refresh sendiri. Script menoleransi itu — ia menyimpan checkpoint per langkah dan **melanjutkan dari langkah terakhir** setelah reload (badge akan menunjuk `↩️ Lanjut <nomor> ...`), bukan mengulang dari nol. Tabel "Last Five Usage" **sudah ikut ter-render di halaman hasil refresh**, jadi pada resume step `lfu` tombol LFU **tidak diklik ulang** — script cukup menunggu tabelnya muncul lalu screenshot. Klik ulang justru memicu refresh baru tanpa henti, dan itulah yang dulu membuat tugas berakhir dengan "Proses terulang karena halaman reload berulang".
 
 ### Test tanpa Telegram (opsional)
 
@@ -202,6 +203,11 @@ Selector halaman Gladius belum terdokumentasi; elemen dicari toleran berdasarkan
 - [x] UserScript Tampermonkey `gladius-embassy.user.js` (ganti agent Python-lokal: polling `/antrian`, proses di halaman, html2canvas screenshot, kirim ke `/kirim`)
 - [x] Endpoint `/kirim` (relay foto base64 → sendPhoto + edit pesan) & `/selesai` (edit pesan gagal)
 - [x] Pindah ke mode lokal: `start_bot.bat` + `SERVER_BOT` = `127.0.0.1:8080`
+- [x] Navigasi langsung ke URL target (tanpa klik menu sidebar) + berhenti jujur kalau sesi Gladius habis
+- [x] Hentikan loop reload "Last Five Usage" — tombol LFU hanya diklik sekali
+- [x] Verifikasi pengisian Nomor Internet + tunggu status password sampai muncul
+- [x] Penghitung reload terpisah (`reload_ours`) + batas percobaan 12
+- [x] Reload penjaga sesi setelah 5 menit sunyi + html2canvas lazy-load + polling 5 dtk
 - [ ] Daftarkan `start_bot.bat` ke Task Scheduler (auto-start setelah PC restart)
-- [ ] Test end-to-end via Telegram: jalankan bot, pasang userscript di Chrome, kirim `/embassy <nomor>`, validasi navigasi/selector/screenshot (html2canvas — ingat risiko iframe)
+- [ ] Test end-to-end via Telegram: jalankan bot, pasang userscript di Chrome, kirim `/embassy <nomor>`, validasi navigasi/selector/screenshot
 - [ ] Auto-start diuji (restart PC → bot harus up sendiri)
