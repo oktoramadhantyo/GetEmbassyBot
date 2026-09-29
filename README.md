@@ -34,7 +34,7 @@ Petugas yang menjaga bot belum aktif / Chrome Gladius belum berjalan.
 Silakan dicoba lagi nanti.
 ```
 
-> Versi lama (Python lokal: `agent.py` + Selenium + Chrome debug port) tetap disimpan sebagai referensi, tetapi **tidak lagi dipakai**. Nilai selector sama, jadi test `python -m scraper.embassy <nomor> --dump` tetap berguna untuk validasi struktur halaman.
+> Jalur Python lokal lama (`agent.py` + Selenium + Chrome debug port) sudah diarsipkan ke `legacy/` dan **tidak lagi dipakai**. Robot sepenuhnya berjalan di userscript Tampermonkey.
 
 ## Perintah Bot
 
@@ -52,18 +52,13 @@ Projek Magang-GetEmbassy/
 ├── README.md
 ├── bot.py                    # SERVER BOT: PTB polling + antrian + HTTP /antrian /kirim /selesai /health
 ├── start_bot.bat             # (lokal) jalankan bot.py + auto-restart + tulis logs/bot.log
-├── agent.py                  # (LAMA, opsional) agent Selenium lokal
-├── config.py                 # konfigurasi pusat via .env
+├── config.py                 # konfigurasi pusat via .env (dibaca bot.py)
 ├── gladius-embassy.user.js   # UserScript Tampermonkey di Chrome PIC — proses Embassy/Password Check
-├── scraper/
-│   ├── browser.py            # (dipakai agent.py lama) cek debug port + attach Chrome login existing
-│   └── embassy.py            # logika cek embassy (sumber JS selector + test CLI --dump)
+├── legacy/                   # arsip jalur lama: agent.py + scraper/ + chrome-profile/ + start_agent.bat (tidak dipakai)
 ├── requirements.txt
 ├── .env.example              # template .env
 ├── .env                      # (gitignored) token & setting
 ├── Procfile                  # web: python bot.py  (hanya dipakai kalau deploy di Railway)
-├── start_agent.bat           # (LAMA, opsional) auto Chrome debug + run agent lama
-├── Screenshot 2026-09-22 125002.png
 ├── outputs/                  # hasil screenshot (gitignored)
 └── logs/                     # log bot lokal (gitignored)
 ```
@@ -72,8 +67,7 @@ Projek Magang-GetEmbassy/
 
 - Python 3.13
 - `python-telegram-bot` (polling)
-- `selenium` (agent lokal, attach ke Chrome yang sudah login — pola BotInsera)
-- `requests` (agent → Telegram Bot API & relay foto)
+- `requests` (relay foto ke Bot API)
 - `python-dotenv`
 
 ## Setup & Cara Menjalankan
@@ -90,7 +84,7 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-Isi minimal untuk lokal: `TELEGRAM_BOT_TOKEN` + `AGENT_SECRET`. `RAILWAY_URL` tidak dipakai saat lokal.
+Isi minimal untuk lokal: `TELEGRAM_BOT_TOKEN` + `AGENT_SECRET`. `AGENT_SECRET` harus sama persis dengan hardcode di userscript.
 
 ### 3. Jalankan bot (lokal)
 
@@ -158,11 +152,15 @@ Kalau nanti mau pindah ke Railway:
 >
 > **Catatan reload:** halaman Gladius memang me-reload tiap kali tombol Cek/Last Five diklik dan kadang auto-refresh sendiri. Script menoleransi itu — ia menyimpan checkpoint per langkah dan **melanjutkan dari langkah terakhir** setelah reload (badge akan menunjuk `↩️ Lanjut <nomor> ...`), bukan mengulang dari nol. Tabel "Last Five Usage" **sudah ikut ter-render di halaman hasil refresh**, jadi pada resume step `lfu` tombol LFU **tidak diklik ulang** — script cukup menunggu tabelnya muncul lalu screenshot. Klik ulang justru memicu refresh baru tanpa henti, dan itulah yang dulu membuat tugas berakhir dengan "Proses terulang karena halaman reload berulang".
 
-### Test tanpa Telegram (opsional)
+### Test struktur halaman (opsional, jalur lama)
+
+Arsip `legacy/scraper` masih bisa dipakai untuk dump struktur halaman:
 
 ```bash
-python -m scraper.embassy 121519246796 --dump
+python legacy/scraper.embassy 121519246796 --dump
 ```
+
+> Butuh Selenium + Chrome debug port sesuai `legacy/agent.py`.
 
 ## Alur Dropdown Domain (Paket Radius / PCRF)
 

@@ -53,6 +53,12 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# Jangan biarkan pustaka HTTP menulis URL lengkap ke log. Setiap polling getUpdates menulis
+# "POST https://api.telegram.org/bot<TOKEN>/getUpdates" sehingga token bot tersimpan plaintext
+# di logs\bot.log dan logs\bot-prev.log, dan 98% baris log jadi noise yang menutupi informasi
+# berguna. Yang tetap dibiarkan: WARNING ke atas, sehingga kegagalan jaringan tetap terlihat.
+for _bising in ("httpx", "httpcore", "hpack", "telegram.ext.Application", "telegram.ext.Updater"):
+    logging.getLogger(_bising).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ==================== ANTRIAN (in-memory) ====================
