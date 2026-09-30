@@ -33,7 +33,8 @@ import logging
 import os
 import re
 import threading
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -65,7 +66,33 @@ logger = logging.getLogger(__name__)
 # task_id -> {"nomor", "jenis", "chat_id", "message_id", "waktu", "status", "pesan"}
 _antrian: dict[str, dict] = {}
 _antrian_lock = threading.Lock()
+# WAJIB monotonik lintas restart. _id_counter biasa kembali ke 0 tiap bot start, sehingga
+# task baru bisa memakai id yang persis sama dengan task lama (mis. T-1) — lalu userscript
+# yang masih menyimpan id itu di sessionStorage akan menganggap task baru "sudah
+# dikerjakan" dan meng-skip-nya diam-diam. Digabung dengan epoch supaya id tidak pernah
+# terulang walau bot sering di-restart.
+_EPOCH = int(time.time())
 _id_counter = 0
+
+# Task yang sudah selesai/ gagal dibuang setelah ini supaya _antrian tidak tumbuh tanpa
+# batas dan nomor lama tidak bisa terulang ke task yang masih hidup.
+ANTRIAN_TTL_MENIT = 30
+
+
+def _buang_task_lama() -> None:
+    """Buang task yang sudah melewati TTL. WAJIB dipanggil dengan _antrian_lock dipegang."""
+    batas = datetime.now() - timedelta(minutes=ANTRIAN_TTL_MENIT)
+    basi = [k for k, v in _antrian.items()
+            if v.get("status") != "pending" and _waktu_task(v) < batas]
+    for k in basi:
+        del _antrian[k]
+
+
+def _waktu_task(task: dict) -> datetime:
+    try:
+        return datetime.fromisoformat(task.get("waktu", ""))
+    except (TypeError, ValueError):
+        return datetime.now()
 
 
 def _tambah_task(
@@ -73,8 +100,9 @@ def _tambah_task(
 ) -> str:
     global _id_counter
     with _antrian_lock:
+        _buang_task_lama()
         _id_counter += 1
-        task_id = f"T-{_id_counter}"
+        task_id = f"T-{_EPOCH}-{_id_counter}"
         _antrian[task_id] = {
             "nomor": nomor,
             "jenis": jenis,
@@ -94,6 +122,7 @@ def _ambil_task(task_id: str) -> dict | None:
 
 def _ambil_pending() -> list[dict]:
     with _antrian_lock:
+        _buang_task_lama()
         return [
             {
                 "id": i,
@@ -153,7 +182,13 @@ def _tele_post(path: str, files=None, data: dict | None = None) -> dict:
         return {"ok": False}
 
 
-def _caption_hasil(nomor: str, waktu: str, paket_ok: bool, lfu_ok: bool) -> str:
+def _caption_hasil(
+    nomor: str,
+    waktu: str,
+    paket_ok: bool,
+    lfu_ok: bool,
+    alasan: str = "",
+) -> str:
     caption = f"Embassy {nomor} | {waktu}"
     if not paket_ok:
         caption += (
@@ -165,11 +200,16 @@ def _caption_hasil(nomor: str, waktu: str, paket_ok: bool, lfu_ok: bool) -> str:
             "\nLast Five Usage gagal atau tidak selesai dimuat. "
             "Gambar berikut adalah hasil Embassy sebelum percobaan riwayat."
         )
-    return caption
+    return caption + _baris_alasan(alasan)
 
 
 def _caption_password(
-    nomor: str, waktu: str, status: str, status_terbaca: bool, dialog: str
+    nomor: str,
+    waktu: str,
+    status: str,
+    status_terbaca: bool,
+    dialog: str,
+    alasan: str = "",
 ) -> str:
     caption = f"Password Check {nomor} | {waktu}"
     status = str(status or "").strip()
@@ -181,7 +221,41 @@ def _caption_password(
         # Jangan menulis "tidak ditemukan": data bisa saja ada, hanya belum ter-render
         # saat screenshot diambil.
         caption += "\nStatus belum terbaca saat diambil. Lihat fotonya."
-    return caption[:1024]
+    return (caption + _baris_alasan(alasan))[:1024]
+
+
+def _baris_alasan(alasan: str) -> str:
+    """Satu baris 'Rincian:' dari userscript, kalau ada.
+
+    Tanpa baris ini setiap kegagalan tampil identik: caption lama berhenti di "tidak
+    ditemukan" tanpa menyebut APA yang menggagalkan, sehingga masalah dropdown tidak
+    bisa dibedakan dari bug selektor.
+    """
+    alasan = str(alasan or "").strip()
+    return f"\nRincian: {alasan[:300]}" if alasan else ""
+
+
+def _data_lengkap(jenis: str, data: dict) -> tuple[bool, str]:
+    """Apakah data task ini benar-benar didapat, dan alasannya kalau tidak.
+
+    Satu-satunya tempat yang memutuskan "berhasil/tidak", dipakai untuk caption DAN
+    untuk pesan antrean — supaya keduanya tidak pernah berbeda pendapat.
+    """
+    if str(jenis or "embassy").lower() == "password":
+        status = str(data.get("status", "") or "").strip()
+        if status and bool(data.get("status_terbaca", True)):
+            return True, ""
+        dialog = str(data.get("dialog", "") or "").strip()
+        if dialog:
+            return False, f'Halaman Gladius: "{dialog[:200]}"'
+        return False, str(data.get("alasan") or "").strip() or "Status belum terbaca."
+    if bool(data.get("paket_ok")):
+        return True, ""
+    return (
+        False,
+        str(data.get("alasan") or "").strip()
+        or f"Paket Radius/PCRF tidak ditemukan dalam {len(DAFTAR_DOMAIN)} domain.",
+    )
 
 
 # ==================== HTTP ENDPOINT (dipanggil userscript Tampermonkey) ====================
@@ -270,6 +344,10 @@ class _Handler(BaseHTTPRequestHandler):
         foto_b64 = data.get("foto", "")
         paket_ok = bool(data.get("paket_ok"))
         lfu_ok = bool(data.get("lfu_ok"))
+        # Satu keputusan dipakai untuk caption DAN pesan antrean, supaya keduanya tidak
+        # pernah berbeda pendapat. Alasannya sudah difilter/di-default di sana.
+        data_lengkap, alasan_final = _data_lengkap(jenis, data)
+        nama = "Password Check" if jenis == "password" else "Embassy"
         task = _ambil_task(tid)
         waktu = str(
             data.get("waktu")
@@ -294,9 +372,10 @@ class _Handler(BaseHTTPRequestHandler):
                 status,
                 bool(data.get("status_terbaca", True)),
                 str(data.get("dialog", "")),
+                alasan_final,
             )
         else:
-            caption = _caption_hasil(nomor, waktu, paket_ok, lfu_ok)
+            caption = _caption_hasil(nomor, waktu, paket_ok, lfu_ok, alasan_final)
         terkirim = _tele_post(
             "sendPhoto",
             files={"photo": io.BytesIO(foto_bytes)},
@@ -304,19 +383,42 @@ class _Handler(BaseHTTPRequestHandler):
         ).get("ok", False)
 
         if terkirim:
+            # PERBAIKAN: pesan lama ditulis "Selesai ✓" setiap kali foto sampai, walau
+            # caption di foto itu sendiri menyatakan paket/statusnya tidak ditemukan.
+            # Antrian tampak berhasil padahal tidak ada data yang diperoleh — dan karena
+            # tanda "berhasil" itu tidak pernah muncul untuk kasus gagal, satu-satunya
+            # yang terlihat selalu "selesai". Sekarang verdict-nya jujur.
+            teks = (
+                f"Selesai ✓\n{nama} {nomor} lengkap."
+                if data_lengkap
+                else f"⚠️ Foto {nomor} terkirim, tapi data {nama} TIDAK lengkap.\n{alasan_final}"
+            )
             _tele_post(
                 "editMessageText",
                 data={
                     "chat_id": chat_id,
                     "message_id": message_id,
-                    "text": "Selesai ✓",
+                    "text": teks[:1024],
                 },
             )
-            _tandai_task(tid, "selesai", "")
+            _tandai_task(
+                tid,
+                "selesai" if data_lengkap else "gagal",
+                "" if data_lengkap else alasan_final,
+            )
         else:
-            _tandai_task(tid, "selesai", "gagal kirim foto dari userscript")
+            _tandai_task(tid, "gagal", "gagal kirim foto dari userscript")
 
-        self._kirim(200, {"ok": True, "sent": terkirim})
+        # Kembalikan verdict ke userscript supaya log di browser punya catatan yang sama.
+        self._kirim(
+            200,
+            {
+                "ok": True,
+                "sent": terkirim,
+                "data_lengkap": bool(data_lengkap) if terkirim else False,
+                "alasan": "" if data_lengkap else alasan_final,
+            },
+        )
 
     def log_message(self, *args):
         pass

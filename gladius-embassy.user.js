@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GetEmbassy Gladius - Proses Otomatis
 // @namespace    http://tampermonkey.net/
-// @version      1.7.6
+// @version      1.8.2
 // @description  [GetEmbassy] Auto-proses antrian /embassy dan /password dari bot lokal/server langsung di halaman Gladius: isi Nomor Internet, proses Embassy atau Password Check, ambil screenshot (html2canvas), lalu kirim base64 ke server bot. Tanpa Python/Selenium/debug port.
 // @author       diana
 // @match        https://gladius.telkom.co.id/*
@@ -15,25 +15,17 @@
 (function () {
   "use strict";
 
-  // html2canvas diambil lewat @require, bukan <script src> yang disuntik ke halaman.
-  // AlasannyaConcrete: unduhan <script src> memakai jalur jaringan Browser, yang di
-  // jaringan ini DIBLOKIR — CDN membalas halaman blokir HTTP 200, isinya diparse sebagai
-  // JS -> syntax error -> event load tetap menyala tapi window.html2canvas tidak pernah
-  // terdefinisi. Gejalanya: "html2canvas gagal dimuat dari semua CDN (… memuat halaman
-  // tanpa fungsi)". PowerShell/terminal bisa mengambil CDN yang sama dengan normal
-  // (terverifikasi 200 + 198.689 byte JS asli), jadi masalahnya jalur, bukan CDN-nya.
-  // @require diunduh oleh ekstensi Tampermonkey, bukan halaman — jalur yang ini yang
-  // sudah terbukti bekerja di v1.5.0.
+  // html2canvas lewat @require, bukan <script src> yang disuntik: jalur <script src>
+  // diblokir jaringan, CDN membalas halaman blokir HTTP 200 sehingga window.html2canvas
   var H2C_ASLI = typeof window.html2canvas === "function" ? window.html2canvas : null;
+
+  // ===================== RIWAYAT PERBAIKAN (arsip) =====================
+  // Daftar bug yang sudah diperbaiki. Semuanya dulu ditulis panjang-lebar di dalam
+  // masing-masing fungsi; sekarang dikumpulkan di sini supaya kode tetap ringkas.
 
   // ===================== NEUTRALISER DIALOG (WAJIB PALING AWAL) =====================
   // Gladius memunculkan window.alert("... data tidak dapat ditemukan ...") saat hasil
   // kosong. Dialog NATIVE membekukan SELURUH JavaScript halaman (setTimeout, promise,
-  // callback XHR) sampai diklik manual. Akibatnya script tidak bisa polling antrian
-  // dan membaca halaman yang belum selesai render. Dialog native tidak bisa ditutup
-  // dari JavaScript, jadi satu-satunya jalan adalah menggantinya SEBELUM script Gladius
-  // memanggilnya — karena itu blok ini harus jalan di document-start, di luar gate
-  // DOMContentLoaded.
   var DIALOG_MAX = 20;
   var DIALOG_LOG = [];
   var DIALOG_TERAKHIR = null; // { pesan, waktu, jenis }
@@ -70,6 +62,17 @@
     return !!(DIALOG_TERAKHIR && POLA_TIDAK_DITEMUKAN.test(DIALOG_TERAKHIR.pesan));
   }
 
+  // WAJIB dipanggil di awal tiap task: DIALOG_TERAKHIR global, jadi tanpa reset dialog
+  // "tidak ditemukan" dari task sebelumnya terbaca sebagai jawaban task berikutnya dan
+  function resetDialog(nomor) {
+    if (DIALOG_TERAKHIR) {
+      log("Reset detector dialog" + (nomor ? " untuk task " + nomor : "") +
+        " (dialog sebelumnya: '" + String(DIALOG_TERAKHIR.pesan || "").slice(0, 100) + "').");
+    }
+    DIALOG_TERAKHIR = null;
+    DIALOG_LOG = [];
+  }
+
   // Nilai yang terlalu panjang/berbentuk kalimat dianggap notifikasi, bukan nilai kolom.
   function terlihatNotifikasi(t) {
     t = normTeks(t);
@@ -81,11 +84,6 @@
   // ===================== PENELUSURAN DOM LINTAS KONTEKS =====================
   // Hasil Gladius tidak selalu hidup di dokumen utama. Dua sebab yang membuat
   // pembacaan lama selalu kosong padahal tabelnya jelas-jelas terisi di layar:
-  //   1. Tabel hasil dirender di dalam <iframe> (panel hasil / widget).
-  //   2. Markup dibangun dengan Shadow DOM, sehingga querySelectorAll biasa tidak
-  //      bisa menembus shadow root.
-  // Script lama tidak menyentuh keduanya sama sekali, sehingga selalu mengembalikan
-  // "" lalu memicu siklus "coba 4 domain".
   var _akarCache = null;
   var _akarCacheWaktu = 0;
   var AKAR_TTL_MS = 1500;
@@ -109,7 +107,6 @@
         antre.push(dalam);
         // Dialog NATIVE di dalam iframe juga membekukan halaman, jadi patch juga
         // window.alert di sana. Kalau tidak, hasil di iframe bisa menggantung
-        // sementara halaman utama tampak "selesai".
         try {
           var win = frames[i].contentWindow;
           if (win && typeof win.alert === "function" && !win.alert.__getEmbassy) {
@@ -135,7 +132,6 @@
 
   // querySelectorAll yang menembus shadow root. Satu kali lintasan untuk selector
   // biasa; rekursif hanya kalau benar-benar ada shadow host (jarang, tapi kalau
-  // ada hasil Gladius bisa tersembunyi di dalamnya).
   function qsSemua(akar, sel) {
     var out = [];
     var semua = [];
@@ -156,8 +152,6 @@
 
   // Bounding rect elemen dalam koordinat HALAMAN UTAMA. Kalau elemennya ada di
   // dalam iframe, getBoundingClientRect() biasanya relatif ke viewport iframe, jadi
-  // kotak potret harus digeser sebesar posisi frame-nya; tanpa ini area screenshot
-  // akan tertelanjur jauh dari tabel.
   function rectDiHalaman(el) {
     var r = el.getBoundingClientRect();
     var kiri = r.left, atas = r.top, kanan = r.right, bawah = r.bottom;
@@ -204,9 +198,8 @@
   // ===================== KONFIGURASI (edit sesuai .env / server bot) =====================
   // SERVER_BOT = URL tempat bot.py berjalan.
   //   Lokal  : "http://127.0.0.1:8080"   (PC yang sama dengan browser Gladius)
-  //   Railway: "https://getembassybot-production.up.railway.app"
-  // Wajib: host yang dipakai juga harus ada di @connect di metadata userscript.
   var SERVER_BOT = "http://127.0.0.1:8080";
+  var PORT_HTTP = 8080; // hanya untuk pesan log; tidak dipakai untuk koneksi
   var AGENT_SECRET = "njcdB4gEitPWyMSFVc58s388";
   var POLL_INTERVAL_DETIK = 5; // jeda polling antrian
   var WAIT_HASIL_MS = 15000; // tunggu hasil "Cek Kualitas Jaringan" stabil
@@ -237,13 +230,18 @@
   // ===================== STATE TOLERAN RELOAD (sessionStorage) =====================
   // Halaman Gladius me-reload tiap klik Cek/LFU dan auto-refresh periodik. State di
   // sessionStorage disimpan SEBELUM tiap langkah berisiko-reload; begitu script
-  // terbangun kembali sesudah reload, ia MELANJUTKAN dari langkah terakhir,
-  // bukan mengulang dari nol (mencegah loop klik->reload).
   var STATE_KEY = "getembassy_state";
   var HANDLED_KEY = "getembassy_handled";
   var MAX_ATTEMPTS = 12; // batas percobaan/reload per task
   var STATE_TTL_MS = 6 * 60 * 1000;
   var HANDLED_TTL_MS = 5 * 60 * 1000;
+  // Log yang bertahan melewati reload. Dulu log hanya tulis ke console.log, padahal
+  // Gladius me-reload halaman setiap kali Cek/LFU diklik — jadi tahap-tahap terpanjang
+  var LOG_KEY = "getembassy_log";
+  var LOG_MAX = 300;
+  var LOG_CHAR_MAX = 500;
+  var _gagalHttp = 0; // gagal HTTP beruntun, supaya log tidak dibanjiri tiap poll 5 dtk
+  var _antrianGagal = 0;
 
   function simpanState(obj) {
     try {
@@ -268,26 +266,70 @@
     try { sessionStorage.removeItem(STATE_KEY); } catch (e) {}
   }
 
-  // id task yang SUDAH selesai dikirim — cegah duplikat bila auto-refresh menyusul.
-  function tandaiHandled(id) {
+  // Kunci anti duplikat: pasangan id+nomor, bukan id saja. Bot me-reset _id_counter tiap
+  // restart sehingga id YANG SAMA (mis. T-1) bisa dipakai task yang beda; kalau hanya id
+  // yang dicek, task baru ikut ter-skip "sudah dikerjakan" dan bot terlihat diam.
+  function kunciHandled(id, nomor) { return String(id || "") + "|" + String(nomor || ""); }
+
+  function bacaHandled() {
+    var h;
+    try { h = JSON.parse(sessionStorage.getItem(HANDLED_KEY) || "{}"); } catch (e) { h = {}; }
+    if (!h || typeof h !== "object") h = {};
+    // Pangkas SAAT BACA. Kalau hanya dipangkas saat tulis, entri lama tidak pernah hilang
+    // selama tidak ada task lain yang sukses kirim — padahal itulah saat yang paling perlu
+    // bersih, karena id lama masih di sana sementara task baru memakai id yang sama.
+    var cut = Date.now() - HANDLED_TTL_MS;
+    var berubah = false;
+    Object.keys(h).forEach(function (k) { if (!h[k] || h[k] < cut) { delete h[k]; berubah = true; } });
+    if (berubah) {
+      try { sessionStorage.setItem(HANDLED_KEY, JSON.stringify(h)); } catch (e2) {}
+    }
+    return h;
+  }
+
+  // id+nomo yang SUDAH selesai dikirim — cegah duplikat bila auto-refresh menyusul.
+  function tandaiHandled(id, nomor) {
     try {
-      var h = JSON.parse(sessionStorage.getItem(HANDLED_KEY) || "{}");
-      h[id] = Date.now();
-      var cut = Date.now() - HANDLED_TTL_MS;
-      Object.keys(h).forEach(function (k) { if (h[k] < cut) delete h[k]; });
+      var h = bacaHandled();
+      h[kunciHandled(id, nomor)] = Date.now();
       sessionStorage.setItem(HANDLED_KEY, JSON.stringify(h));
     } catch (e) {}
   }
 
-  function sudahHandled(id) {
-    try {
-      var h = JSON.parse(sessionStorage.getItem(HANDLED_KEY) || "{}");
-      return !!h[id];
-    } catch (e) { return false; }
+  function sudahHandled(id, nomor) {
+    return !!bacaHandled()[kunciHandled(id, nomor)];
   }
 
   function log(msg) {
-    console.log("[GetEmbassy]", msg);
+    try { console.log("[GetEmbassy]", msg); } catch (e) {}
+    try {
+      var jam = new Date();
+      var baris = ("0" + jam.getHours()).slice(-2) + ":" + ("0" + jam.getMinutes()).slice(-2) +
+        ":" + ("0" + jam.getSeconds()).slice(-2) + " " + String(msg).slice(0, LOG_CHAR_MAX);
+      var arr;
+      try { arr = JSON.parse(sessionStorage.getItem(LOG_KEY) || "[]"); } catch (e2) { arr = []; }
+      if (!Array.isArray(arr)) arr = [];
+      arr.push(baris);
+      while (arr.length > LOG_MAX) arr.shift();
+      sessionStorage.setItem(LOG_KEY, JSON.stringify(arr));
+    } catch (e3) {}
+  }
+
+  // Isi buffer log, untuk tombol "📋". Kalau log kosong, tetap kembalikan penanda waktu
+  // supaya tidak terlihat seperti "tidak ada yang terjadi" padahal buffer-nya belum sempat
+  function ambilLog() {
+    var arr = [];
+    try {
+      var raw = JSON.parse(sessionStorage.getItem(LOG_KEY) || "[]");
+      if (Array.isArray(raw)) arr = raw;
+    } catch (e) {}
+    if (!arr.length) return "(belum ada log — bot mungkin belum memproses task apa pun)";
+    return arr.join("\n");
+  }
+
+  // Padakan URL supaya AGENT_SECRET tidak ikut tersalin ke log/clipboard.
+  function urlPendek(u) {
+    return String(u || "").replace(/([?&]secret=)[^&]*/i, "$1***");
   }
 
   function wait(ms) {
@@ -432,7 +474,7 @@
       el.dispatchEvent(new Event("change", { bubbles: true }));
       el.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Process" }));
       el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "Process" }));
-      // Verifikasi sungguhan: versi lama selalu return true walau kolomnya tetap kosong,
+      // Verifikasi sungguhan: return true hanya bila kolom benar-benar berisi nomor,
       // sehingga tombol Cek ditekan dengan input kosong dan hasilnya selalu gagal.
       var isi = String(el.value || "").replace(/\D/g, "");
       if (isi === mau && isi.length > 0) return true;
@@ -445,7 +487,6 @@
 
   // Apakah kolom Nomor Internet saat ini masih memuat nomor yang diharapkan? Dipakai
   // sebelum klik Cek ulang: klik Cek bisa memicu reload penuh, dan kolom pun kembali
-  // kosong padahal kita sudah merasa "sudah mengisinya" sebelumnya.
   function nomorMasihTerisi(nomor) {
     var mau = String(nomor == null ? "" : nomor).replace(/\D/g, "");
     if (!mau) return false;
@@ -454,6 +495,8 @@
     return String(el.value || "").replace(/\D/g, "") === mau;
   }
 
+  // Pilih domain di dropdown, lalu VERIFIKASI select benar-benar berganti.
+  // o.value, tanpa pernah memastikan select benar-benar berganti — jadi "berhasil" bisa
   function pilihDomain(domain) {
     domain = String(domain).toLowerCase().trim();
     var pat = /\./;
@@ -468,15 +511,31 @@
       for (var k = 0; k < s.options.length; k++) {
         var o = s.options[k];
         var teks = ((o.text || "") + " " + (o.value || "")).replace(/\s+/g, " ").trim().toLowerCase();
-        if (teks.indexOf(domain) >= 0) {
-          s.value = o.value;
-          s.dispatchEvent(new Event("change", { bubbles: true }));
-          s.dispatchEvent(new Event("input", { bubbles: true }));
+        if (teks.indexOf(domain) < 0) continue;
+        var sebelum = s.selectedIndex;
+        s.selectedIndex = k;
+        s.dispatchEvent(new Event("change", { bubbles: true }));
+        s.dispatchEvent(new Event("input", { bubbles: true }));
+        if (s.selectedIndex !== sebelum) {
+          log("Domain → " + domain + " (opsi #" + k + " '" + o.text + "' di select #" + i + ").");
           return true;
         }
+        // Cadangan: nilai option bisa string kosong sehingga .value tidak menandai apa pun.
+        s.value = o.value;
+        s.dispatchEvent(new Event("change", { bubbles: true }));
+        if (String(s.value) === String(o.value) && o.value !== "") {
+          log("Domain → " + domain + " (fallback .value, select #" + i + ").");
+          return true;
+        }
+        log("Domain '" + domain + "' ADA di select #" + i + " tapi select tidak bereaksi " +
+          "(selectedIndex " + sebelum + " → " + s.selectedIndex + ").");
       }
     }
-    if (klikTeks(domain, false)) return true;
+    if (klikTeks(domain, false)) {
+      log("Domain → " + domain + " lewat klik teks (bukan <select>).");
+      return true;
+    }
+    log("Domain '" + domain + "' tidak ditemukan: tidak ada <select> domain yang memuatnya, dan teksnya tidak bisa diklik.");
     return false;
   }
 
@@ -497,34 +556,52 @@
   }
 
   // Baca nilai paket (Paket Radius / Paket PCRF) dari tabel hasil Gladius.
-  //
   // Bentuk render: (a) key-value horizontal, (b) header kolom + nilai di baris bawah,
-  // (c) satu sel "Paket Radius : 10 Mbps". URUTAN PENTING: (c) -> (b) -> (a); kolom
-  // diperiksa lebih dulu daripada sel tetangga supaya baris header tidak terbaca sebagai
-  // nilai paket. `return ""` hanya untuk kandidat yang jelas-jelas jelek, tidak
-  // membatalkan seluruh pembacaan.
   var _BATAS_SCAN_KOLOM = 30;
+
+  // Fragmen regex yang dipakai bersama oleh pola label dan pola "label + nilai",
+  // supaya keduanya pasti sepakat soal bentuk header gabungan. Tanpa ini, header
+  var ATURAN_SATU_LABEL_PAKET = "(?:" + esc(TEKS_KOLOM_PAKET) + "|" + esc(TEKS_KOLOM_PAKET_ALT) + ")";
+  var OPSIONAL_PARENS = "(?:\\s*\\([^)]*\\))?";
+  var PEMISAH_LABEL = "\\s*(?:\\/|\\||&|,|\\bdan\\b|\\bor\\b|\\bx\\b)\\s*";
 
   // Label "Paket Radius" / "Paket PCRF" yang diperluas: boleh diakhiri sebuah grup
   // kurung untuk unit/sifat, mis. "Paket Radius (Mbps)" — tanpa menerima teks bebas.
   var _polaLabelPaket = null;
   function polaLabelPaket() {
     if (!_polaLabelPaket) {
+      var satu = ATURAN_SATU_LABEL_PAKET;
       _polaLabelPaket = new RegExp(
-        "^\\s*(?:" + esc(TEKS_KOLOM_PAKET) + "|" + esc(TEKS_KOLOM_PAKET_ALT) + ")\\s*(\\(.*?\\))?\\s*[:=-]?\\s*$",
+        "^\\s*" + satu + OPSIONAL_PARENS +
+        "(?:" + PEMISAH_LABEL + satu + OPSIONAL_PARENS + ")*" +
+        "\\s*[:=-]?\\s*$",
         "i"
       );
     }
     return _polaLabelPaket;
   }
 
+  // Jalur (c): "label + nilai dalam satu sel". Nilai WAJIB tertangkap di grup terpisah.
+  var _polaSatuSelPaket = null;
+  function polaSatuSelPaket() {
+    if (!_polaSatuSelPaket) {
+      var satu = ATURAN_SATU_LABEL_PAKET;
+      _polaSatuSelPaket = new RegExp(
+        "^\\s*" + satu + OPSIONAL_PARENS +
+        "(?:" + PEMISAH_LABEL + satu + OPSIONAL_PARENS + ")*" +
+        // Label lalu nilai. Pemisah boleh ":" "=" "-" ATAU spasi saja. Backtrack ke spasi
+        // wajib ada, kalau tidak "Paket Radius 10 Mbps" tak akan tertangkap.
+        "(?:\\s*[:=-]|\\s+)\\s*(\\S.*)$",
+        "i"
+      );
+    }
+    return _polaSatuSelPaket;
+  }
+
   function bacaPaket() {
     if (dialogMenyatakanKosong()) return "";
     var polaLabel = polaLabelPaket();
-    var polaSatuSel = new RegExp(
-      "^\\s*(?:" + esc(TEKS_KOLOM_PAKET) + "|" + esc(TEKS_KOLOM_PAKET_ALT) + ")\\s*(\\(.*?\\))?\\s*[:=-]?\\s*(\\S.*)$",
-      "i"
-    );
+    var polaSatuSel = polaSatuSelPaket();
     var jejak = [];
     var akar = akarSemua();
     var a, i, c, j, s;
@@ -540,15 +617,17 @@
         if (!s.length) continue;
 
         // (c) label + nilai dalam satu sel: "Paket Radius : 10 Mbps"
-        // nilai = grup tangkap TERAKHIR; grup pertama adalah kurung opsional.
+        // Grup tangkap PERTAMA adalah nilai (label sudah terpisah dari nilai di dalam
         for (c = 0; c < s.length; c++) {
           var isi = normTeks(s[c].innerText || s[c].textContent);
+          // Sel yang SELURUHNYA label murni tidak mungkin jadi baris nilai. Dicek lebih
+          // dulu karena pola satu-sel bisa mundur (backtrack): grup parens " (Mbps)"
           var m = isi.match(polaSatuSel);
           if (!m) continue;
-          var sisa = normTeks(m[m.length - 1]);
-          // "Paket Radius (Mbps)" tanpa nilai: grup tangkap terakhir = kurung polos
-          // dan grup 1 (kurung opsional) kosong -> ini label murni, bukan nilai.
-          if (!m[1] && /^\([^)]*\)$/.test(sisa)) continue;
+          // Grup 1 kosong = hanya label ("Paket Radius" tanpa nilai).
+          if (m[1] === undefined) continue;
+          var sisa = normTeks(m[1]);
+          if (!sisa) continue;
           if (terimaNilaiPaket(sisa)) { catatPaketJejak(nama + " satu-sel", sisa); return sisa; }
           jejak.push(nama + " satu-sel ditolak: " + JSON.stringify(sisa));
         }
@@ -589,7 +668,6 @@
 
         // Label ketemu di akar ini tapi nilai tidak → jangan lanjut cari akar lain
         // hanya atas dasar teks yang sama; tapi kalau masih kosong total di atas,
-        // lewatkan ke jalur non-tabel akar berikutnya.
         var nilaiTabel = bacaPaketJalurNonTabel(root, polaLabel, polaSatuSel, jejak, nama);
         if (nilaiTabel) { catatPaketJejak(nama + " saudara", nilaiTabel); return nilaiTabel; }
         continue;
@@ -605,7 +683,6 @@
 
   // Jalur cadangan untuk hasil yang BUKAN tabel (div/span/li/dll.): cari ELEMEN DAUN
   // berlabel Paket Radius, lalu ambil teks saudara/vicinanya. Versi tersimpan di
-  // bacaPaket() hanya menyisir <tr>, sehingga hasil berlabel non-tabel selalu "".
   function bacaPaketJalurNonTabel(root, polaLabel, polaSatuSel, jejak, nama) {
     var semua = [];
     try { semua = root.querySelectorAll("div,span,li,td,th,p,label,dt,dd"); } catch (e) { return ""; }
@@ -614,13 +691,17 @@
       if (el.children && el.children.length > 0) continue; // hanya elemen daun
       var t = normTeks(el.innerText || el.textContent);
       if (!t) continue;
-      var m = t.match(polaSatuSel);
-      if (m) {
-        var sisa = normTeks(m[m.length - 1]); // grup terakhir = nilai (grup 1 = kurung opsional)
-        if (!m[1] && /^\([^)]*\)$/.test(sisa)) sisa = "";
-        if (sisa && terimaNilaiPaket(sisa)) return sisa;
+      var labelMurni = polaLabel.test(t);
+      if (!labelMurni) {
+        // Sama seperti jalur tabel: sel label murni ("Paket Radius (Mbps)", "Paket
+        // Radius / Paket PCRF") tidak boleh salah dibaca jadi nilai lewat backtrack pola.
+        var m = t.match(polaSatuSel);
+        if (m && m[1] !== undefined) {
+          var sisa = normTeks(m[1]);
+          if (sisa && terimaNilaiPaket(sisa)) return sisa;
+        }
       }
-      if (!polaLabel.test(t)) continue;
+      if (!labelMurni) continue;
       var nx = el.nextElementSibling;
       if (nx) {
         var v = normTeks(nx.innerText || nx.textContent);
@@ -637,8 +718,6 @@
 
   // Alat bantu debug, bisa dipanggil manual dari Console: GetEmbassyDebug.struktur()
   // Mencatat di mana teks "paket radius/pcrf" benar-benar hidup (dokumen utama,
-  // iframe, atau shadow root) plus tag/class/teksnya. Kalau pembacaan masih kosong,
-  // hasil fungsi ini adalah data yang dibutuhkan — tanpa menebak lagi.
   function mtgStrukturPaket() {
     var out = [];
     var akar = akarSemua();
@@ -665,7 +744,6 @@
 
   // Alat bantu debug LFU: cari posisi teks "Last Five Usage" + panelnya (tag, class,
   // rect, jumlah baris). Kalau deteksi LFU masih salah, hasil ini menunjukkan apakah
-  // panel di dokumen utama, iframe, position:fixed, atau markup non-tabel.
   function mtgStrukturLfu() {
     var out = [];
     var akar = akarSemua();
@@ -704,7 +782,6 @@
 
   // Alat bantu debug status Password: cari semua elemen berlabel "status" lintas konteks
   // (dokumen utama + iframe + shadow) plus nilai pasangannya. Dipakai kalau bacaStatusPassword
-  // masih kosong: hasil ini menunjukkan di mana label itu berada dan kenapa tidak terbaca.
   function mtgStrukturPassword() {
     var out = [];
     var akar = akarSemua();
@@ -750,13 +827,15 @@
 
   // Nilai paket yang layak diterima.
   // SENGAJA tidak memakai terlihatNotifikasi(): aturan ">60 karakter = notifikasi" itu
-  // untuk teks notifikasi halaman, sedangkan nilai paket yang sah boleh panjang,
-  // mis. "10 Mbps (Unlimited, 30 hari)".
+  var POLA_SISA_LABEL_PAKET = /\bpaket\b/i;
   function terimaNilaiPaket(nilai) {
     nilai = normTeks(nilai);
     if (!nilai) return false;
     if (POLA_TIDAK_DITEMUKAN.test(nilai)) return false;
     if (nilaiKosong(nilai)) return false;
+    // Netsa pengaman: nilai paket yang sah TIDAK PERNAH memuat kata "paket". Kalau
+    // memuat, berarti ini sisa label(header gabungan) yang lolos dari pemisahan label,
+    if (POLA_SISA_LABEL_PAKET.test(nilai)) return false;
     return true;
   }
 
@@ -824,8 +903,6 @@
 
   // Tunggu sampai Gladius benar-benar selesai render, bukan sekadar "panjang teks tidak
   // berubah ~1 detik" (versi lama resolve terlalu awal saat XHR masih berjalan).
-  // Syarat: tidak ada dialog membekukan halaman, tidak ada spinner/overlay loading, dan
-  // isi area hasil berubah dari snapshot sebelum aksi.
   function adaSpinner() {
     var sel = ".fa-spinner,.spinner,.loading,.loader,[class*='spinner'],[class*='loader'],[aria-busy='true']";
     var els;
@@ -885,19 +962,104 @@
     return jenis === "password" ? URL_PASSWORD : URL_EMBASSY;
   }
 
+  function namaHalaman(jenis) {
+    return jenis === "password" ? "Password Check" : "Embassy";
+  }
+
   function diHalamanTarget(jenis) {
     return pathSekarang() === pathTarget(jenis);
   }
 
+  // Sesi Gladius sudah tidak terautentikasi? Tanpa cek ini bot tetap saja mencoba
+  // mengisi "Internet Number" ke kolom NIK di halaman login, gagal, lalu mengulang
+  // puluhan kali tanpa pernah sampai ke halaman target — gejalanya terlihat seperti
+  // "bot mati", padahal penyebabnya session expired.
+  //
+  // Sinyal: path /public/login (dan turunannya msg/otp), form NIK, atau banner
+  // "Belum Di Daftarkan" yang Gladius tampilkan saat akun tidak terdaftar.
+  var POLA_LOGIN = /belum\s+(di\s+)?daftar|tidak\s+terdaftar|silahkan\s+koordinasi/i;
+
+  function sesiTdkValid() {
+    var p = String(location.pathname || "");
+    if (p.indexOf("/public/login") === 0 || p.indexOf("/public/otp/") === 0) return true;
+    if (qsSemua(document, "input[name='uname'], input#uname, input[name='captcha\\[input\\]']").length) {
+      return true;
+    }
+    var banner = qsSemua(document, ".alert-danger, .alert-warning");
+    for (var i = 0; i < banner.length; i++) {
+      if (POLA_LOGIN.test(teksEl(banner[i]))) return true;
+    }
+    return false;
+  }
+
+  // Hentikan seluruh siklus, bukan cuma task ini: setiap task berikutnya akan gagal
+  // dengan sebab yang sama, dan tanpa henti itu antrian hanya berputar di tempat.
+  var SESI_HABIS_ATAS = false;
+  // Jeda setelah kabari sesi habis. Cukup untuk memberi waktu login, dan tetap
+  // encapsulate kegagalan: bot diam sebentar lalu mencoba lagi bila kamu belum sempat.
+  var SESI_HABIS_TUNGGU_MS = 30000;
+
+  async function stopkarenaSesiHabis(st) {
+    if (SESI_HABIS_ATAS) return;
+    SESI_HABIS_ATAS = true;
+    var pesan = "Sesi Gladius habis (halaman login muncul). Silakan login ulang di tab " +
+      "browser, lalu bot akan lanjut sendiri dari antrian.";
+    setStatus("🔴 Sesi Gladius habis — login ulang dulu");
+    log("SESI HABIS: " + pesan);
+    if (st) {
+      await gagalkan(st, pesan);
+    } else {
+      // Tidak ada task aktif: tetap kabari lewat task pending pertama supaya
+      // pemilik bot tahu tanpa harus membuka log.
+      try {
+        var pending = await ambilAntrian();
+        if (pending && pending.length) {
+          await gagalkan({ id: pending[0].id, nomor: pending[0].nomor,
+                           jenis: pending[0].jenis, chat_id: pending[0].chat_id,
+                           message_id: pending[0].message_id }, pesan);
+        }
+      } catch (e) {
+        log("Gagal mengkabari sesi habis: " + e);
+      }
+    }
+  }
+
+  // Tunggu sampai location.pathname benar-benar jadi target. Hanya berguna saat
+  // navigasi TOLAK (mis. dialog beforeunload yang menahan, atau URL yang diblokir):
+  function tungguPathBerubah(target, maksMs) {
+    return new Promise(function (resolve) {
+      var akhir = Date.now() + (maksMs || 8000);
+      (function cek() {
+        if (pathSekarang() === target) { resolve(true); return; }
+        if (Date.now() >= akhir) { resolve(false); return; }
+        setTimeout(cek, 250);
+      })();
+    });
+  }
+
   // Navigasi langsung ke URL target. Klik menu sidebar DIHAPUS karena homepage Gladius
   // tidak punya sidebar (hanya kartu dashboard), sehingga tungguMenu selalu kehabisan
-  // 3 dtk + 5 dtk lalu mengklik elemen kartu yang salah. URL kedua halaman sudah
-  // terverifikasi (lihat LOG-MAGANG/2026-09-28.md bagian 2.2).
   async function bukaHalaman(jenis) {
+    var target = pathTarget(jenis);
     if (diHalamanTarget(jenis)) return "ready";
-    setStatus("🔎 Membuka halaman " + (jenis === "password" ? "Password Check" : "Embassy") + " ...");
-    try { location.assign(targetURL(jenis)); } catch (e) {}
-    return "navigating";
+    setStatus("🔎 Membuka halaman " + namaHalaman(jenis) + " ...");
+    var url = targetURL(jenis);
+    var awal = pathSekarang();
+    for (var percobaan = 1; percobaan <= 3; percobaan++) {
+      log("Navigasi #" + percobaan + ": " + pathSekarang() + " → " + target + " (" + urlPendek(url) + ")");
+      try {
+        if (percobaan === 1) location.assign(url);
+        else location.replace(url);
+      } catch (e) {
+        log("location." + (percobaan === 1 ? "assign" : "replace") + " melempar: " + e);
+      }
+      // Halaman masih hidup berarti navigasi belum terjadi.
+      if (await tungguPathBerubah(target, 8000)) return "navigating";
+      log("Navigasi #" + percobaan + " tidak memberi hasil (path masih " + pathSekarang() + ")");
+    }
+    log("Navigasi GAGAL ke " + target + " setelah 3 percobaan. Awal " + awal +
+      ", akhir " + pathSekarang() + ". Dugaan: sesi Gladius habis / halaman memantul ke login.");
+    return "gagal";
   }
 
   async function tungguFormTugas(jenis) {
@@ -948,7 +1110,7 @@
         // Stops as soon as a real value is present, or when the page explicitly
         // says the data does not exist (no point in waiting out the full timeout).
         if (!nilaiKosong(v) || dialogMenyatakanKosong() || Date.now() - mulai >= maxMs) {
-          // Kalau kehabisan waktu tanpa nilai, katakan terus terang di console. Versi lama
+          // Kalau kehabisan waktu tanpa nilai, katakan terus terang di console.
           // diam saja, sehingga "paket tidak terbaca" indistinguishable dari "halaman lambat".
           if (nilaiKosong(v) && !dialogMenyatakanKosong()) {
             try {
@@ -963,8 +1125,21 @@
     });
   }
 
+  // Pagar rekursi lanjutDariCek(). Fungsi ini memanggil dirinya sendiri setelah tiap
+  // percobaan domain; tanpa batas eksplisit, kombinasi apa pun yang tidak pernah maju
+  var BATAS_LANJUT_CEK = 12;
+
   // Setelah tombol "Cek" ditekan (inline ATAU resume pasca-reload): baca hasilnya.
-  async function lanjutDariCek(st) {
+  async function lanjutDariCek(st, kedalaman) {
+    kedalaman = kedalaman || 0;
+    if (kedalaman > BATAS_LANJUT_CEK) {
+      log("Batas " + BATAS_LANJUT_CEK + " percobaan habis untuk " + st.nomor +
+        " → hentikan, kirim screenshot apa adanya.");
+      st.paket_ok = false;
+      st.alasan = "Proses berhenti setelah " + BATAS_LANJUT_CEK +
+        " percobaan tanpa paket terbaca.";
+      return lanjutKeScreenshot(st);
+    }
     var paket = await tungguHasilPaket(30000);
     if (!nilaiKosong(paket)) {
       st.paket_ok = true;
@@ -977,8 +1152,12 @@
 
     var domain = domainBerikutnya(st);
     if (!domain) {
-      // SEMUA domain kosong → tetap kirim screenshot (tanpa Last Five Usage).
+      // SEMUA domain habis dicoba → tetap kirim screenshot (tanpa Last Five Usage).
+      // Bedakan DUA sebab yang tadinya tercampur jadi satu: dropdown domain yang tidak
       st.paket_ok = false;
+      st.alasan = (st.domain_gagal || []).length
+        ? "Tidak berhasil menguji semua domain — " + st.domain_gagal.join("; ") + "."
+        : "Paket tidak ditemukan pada semua domain (" + (st.coba || []).join(", ") + ").";
       return lanjutKeScreenshot(st);
     }
 
@@ -995,51 +1174,116 @@
         throw new Error("Gagal mengisi ulang Nomor Internet saat coba domain " + domain + ".");
       }
     }
-    if (pilihDomain(domain) && klikTeks(TEKS_TOMBOL_CEK, true)) {
-      // Klik Cek memicu reload halaman. Ini reload milik kita, catat terpisah.
-      st.reload_ours = (st.reload_ours || 0) + 1;
-      simpanState(st);
-      await tungguTenang(WAIT_HASIL_MS, sidikJari());
-      // Bila klik tadi memicu reload, bagian ini mati → resume yang meneruskan.
-      return lanjutDariCek(bacaState() || st);
+    if (!pilihDomain(domain)) {
+      st.domain_gagal = (st.domain_gagal || []).concat([domain + " (dropdown tidak berubah)"]);
+      log("Gagal memilih domain " + domain + " → coba domain berikutnya.");
+      await wait(1200);
+      return lanjutDariCek(st, kedalaman + 1);
     }
-    return lanjutDariCek(st);
+    if (!klikTeks(TEKS_TOMBOL_CEK, true)) {
+      st.domain_gagal = (st.domain_gagal || []).concat([domain + " (tombol Cek tidak diklik)"]);
+      log("Domain " + domain + " terpasang tapi tombol '" + TEKS_TOMBOL_CEK +
+        "' tidak bisa diklik → lewati domain ini.");
+      await wait(1200);
+      return lanjutDariCek(st, kedalaman + 1);
+    }
+    // Klik Cek memicu reload halaman. Ini reload milik kita, catat terpisah.
+    st.reload_ours = (st.reload_ours || 0) + 1;
+    simpanState(st);
+    await tungguTenang(WAIT_HASIL_MS, sidikJari());
+    // Bila klik tadi memicu reload, bagian ini mati → resume yang meneruskan.
+    return lanjutDariCek(bacaState() || st, kedalaman + 1);
   }
 
-  function cariElemenStatusPassword() {
-    var labels = ["status password", "password status", "status pelanggan", "status"];
-    // SISIR SEMUA KONTEKS (dokumen utama + iframe + shadow root), bukan hanya document.
-    // Dulu hanya document; bila hasil Password dirender di iframe, label tidak pernah
-    // ditemukan dan alur menunggu sampai timeout lalu foto tabel kosong.
+  // Label status yang dipakai tabel hasil Gladius. Lebih lebar dari sekadar "status"
+  // supaya tidak tergantung pada satu istilah.
+  var LABEL_STATUS_PW = [
+    "status password", "password status", "status pelanggan", "status paket",
+    "status internet", "status langganan", "status",
+  ];
+
+  // offsetParent SALAH untuk elemen position:fixed — containing block-nya viewport, jadi
+  // offsetParent tetap null meski elemennya jelas terlihat. Panel hasil Gladius memang
+  function terlihatReally(el) {
+    try {
+      var r = el.getBoundingClientRect();
+      if (!r || r.width <= 0 || r.height <= 0) return false;
+    } catch (e) { return false; }
+    try {
+      var cs = window.getComputedStyle(el);
+      if (cs && (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0")) {
+        return false;
+      }
+    } catch (e2) {}
+    return true;
+  }
+
+  // Semua kandidat elemen berlabel status, bukan cuma yang pertama.
+  // mengembalikan kandidat PERTAMA di urutan DOM; kalau ada "Status" lain di halaman
+  function kumpulkanStatusPassword() {
+    var out = [];
     var akar = akarSemua();
     for (var a = 0; a < akar.length; a++) {
-      var nodes = qsSemua(akar[a], "td, th, label, span, div");
+      var nodes = [];
+      try {
+        nodes = qsSemua(akar[a], "td, th, label, span, div, p, li, dt, dd, strong, b, h1, h2, h3, h4");
+      } catch (e) { continue; }
       for (var i = 0; i < nodes.length; i++) {
         var el = nodes[i];
-        if (el.offsetParent === null) continue;
         var t = teksEl(el).toLowerCase();
         if (!t || t.length > 300) continue;
-        for (var j = 0; j < labels.length; j++) {
-          if (t === labels[j] || t.indexOf(labels[j] + " ") >= 0 || t.indexOf(labels[j] + ":") >= 0) {
-            return el;
+        for (var j = 0; j < LABEL_STATUS_PW.length; j++) {
+          var L = LABEL_STATUS_PW[j];
+          if (t === L || t.indexOf(L + " ") >= 0 || t.indexOf(L + ":") >= 0 || t.indexOf(L + "-") >= 0) {
+            // Elemen yang teksnya jauh lebih besar dari labelnya adalah container/tabel
+            // besar, bukan sel status — jangan dipakai sebagai titik awal pembacaan.
+            if (t.length > L.length + 120) break;
+            out.push(el);
+            break;
           }
         }
       }
     }
-    return null;
+    // Yang terlihat didahulukan: label tersembunyi bisa milik widget lain.
+    out.sort(function (x, y) {
+      return (terlihatReally(y) ? 1 : 0) - (terlihatReally(x) ? 1 : 0);
+    });
+    return out;
+  }
+
+  function cariElemenStatusPassword() {
+    var all = kumpulkanStatusPassword();
+    for (var i = 0; i < all.length; i++) if (terlihatReally(all[i])) return all[i];
+    // Tidak ada yang "terlihat" — tetap coba yang pertama daripada menyerah, karena panel
+    // hasil kadang memang belum selesai tampil.
+    return all.length ? all[0] : null;
   }
 
   // Status tidak terbaca TIDAK lagi ditulis sebagai kalimat "tidak ditemukan" karena
   // ikut masuk ke caption Telegram dan menyesatkan (data sebenarnya ada, hanya belum
-  // ter-render). Sekarang dikembalikan "" + flag terpisah.
   var STATUS_PW_TERBACA = false;
+
+  // Alasan penolakan terakhir untuk log.
+  // sehingga "status tidak terbaca" tidak bisa dibedakan dari "tabelnya belum selesai
+  var _alasanStatusPw = null;
+  function catatStatusPw(berhasil, alasan) {
+    if (berhasil) {
+      if (_alasanStatusPw !== "") log("Status password: TERBACA.");
+      _alasanStatusPw = "";
+      return;
+    }
+    if (alasan && _alasanStatusPw !== alasan) {
+      _alasanStatusPw = alasan;
+      log("Status password: belum terbaca — " + alasan);
+    }
+  }
 
   function bacaStatusPassword() {
     STATUS_PW_TERBACA = false;
-    var labels = ["status password", "password status", "status pelanggan", "status"];
+    var labels = LABEL_STATUS_PW;
     // Sama seperti cariElemenStatusPassword: tabel status bisa hidup di iframe yang
     // dirender halaman Password. qsSemua menembus iframe+shadow, jadi pemindai ini
-    // menjangkau konteks yang tadinya ditutup oleh document.querySelectorAll.
+    var alasan = [];
     var akar = akarSemua();
     for (var a = 0; a < akar.length; a++) {
       var tables = qsSemua(akar[a], "table");
@@ -1059,64 +1303,194 @@
             if (!isStatus) continue;
             for (var ri = hi + 1; ri < trs.length; ri++) {
               var dataCells = trs[ri].querySelectorAll("td");
-              var statusValue = dataCells[h] ? teksEl(dataCells[h]) : "";
-              if (statusValue && !terlihatNotifikasi(statusValue)) {
+              // CADANGAN: indeks header tidak selalu sejajar dengan indeks sel data
+              // (colspan/rowspan, atau tabel yang <th>-nya hilang). Versi lama hanya
+              var urutan = [];
+              if (dataCells[h]) urutan.push(dataCells[h]);
+              for (var q = 0; q < dataCells.length; q++) {
+                if (q !== h) urutan.push(dataCells[q]);
+              }
+              for (var u = 0; u < urutan.length; u++) {
+                var statusValue = teksEl(urutan[u]);
+                if (!statusValue) continue;
+                if (statusValue.toLowerCase() === headerText) continue; // masih label
+                if (terlihatNotifikasi(statusValue)) {
+                  alasan.push("sel '" + statusValue.slice(0, 40) + "' ditolak (terbaca notifikasi)");
+                  continue;
+                }
                 STATUS_PW_TERBACA = true;
+                catatStatusPw(true, "");
                 return statusValue.slice(0, 200);
               }
+              alasan.push("semua sel baris " + (ri + 1) + " kosong/ditolak di bawah header '" +
+                headerText + "'");
             }
           }
         }
       }
     }
-    var el = cariElemenStatusPassword();
-    if (!el) return "";
-    var row = el.closest("tr");
-    if (row) {
-      var cells = row.querySelectorAll("td, th");
-      for (var i = 0; i < cells.length; i++) {
-        if (cells[i] === el && i + 1 < cells.length) {
-          var value = teksEl(cells[i + 1]);
-          if (value && !terlihatNotifikasi(value)) {
-            STATUS_PW_TERBACA = true;
-            return value.slice(0, 200);
+    // Coba SETIAP kandidat berlabel status, bukan hanya yang pertama. Halaman Gladius
+    // punya lebih dari satu tempat yang bisa memuat kata "status", dan versi lama berhenti
+    var kandidat = kumpulkanStatusPassword();
+    if (!kandidat.length) {
+      alasan.push("label status tidak ditemukan di halaman mana pun");
+      catatStatusPw(false, ringkasAlasan(alasan));
+      return "";
+    }
+    alasan.push(kandidat.length + " kandidat berlabel status diperiksa");
+    for (var ki = 0; ki < kandidat.length && ki < 15; ki++) {
+      var el = kandidat[ki];
+      var labelText = teksEl(el).toLowerCase();
+
+      // (i) di dalam baris tabel: nilai = sel lain yang bukan label.
+      var row = el.closest("tr");
+      if (row) {
+        var cells = row.querySelectorAll("td, th");
+        for (var i = 0; i < cells.length; i++) {
+          if (cells[i] === el) continue;
+          var value = teksEl(cells[i]);
+          if (!value) continue;
+          if (value.toLowerCase() === labelText) continue;
+          if (terlihatNotifikasi(value)) {
+            alasan.push("sel '" + value.slice(0, 40) + "' ditolak (terbaca notifikasi)");
+            continue;
           }
+          STATUS_PW_TERBACA = true;
+          catatStatusPw(true, "");
+          return value.slice(0, 200);
+        }
+        alasan.push("baris '" + labelText.slice(0, 30) + "' tidak punya sel lain yang berisi");
+      }
+
+      // (ii) saudara langsung (layout non-tabel / definition list).
+      var sibling = el.nextElementSibling;
+      if (sibling) {
+        var siblingText = teksEl(sibling);
+        if (siblingText && siblingText.length <= 200 && !terlihatNotifikasi(siblingText)) {
+          STATUS_PW_TERBACA = true;
+          catatStatusPw(true, "");
+          return siblingText;
+        }
+        if (siblingText) {
+          alasan.push("saudara '" + labelText.slice(0, 20) + "' berisi '" +
+            siblingText.slice(0, 40) + "' (ditolak)");
+        }
+      }
+
+      // (iii) inline di dalam teksnya sendiri: "Status: Aktif".
+      var text = teksEl(el);
+      var match = text.match(/status(?:\s+(?:password|pelanggan|paket|internet|langganan))?\s*[:\-]\s*(.+)$/i);
+      if (match && match[1]) {
+        var mv = match[1].trim();
+        if (!terlihatNotifikasi(mv)) {
+          STATUS_PW_TERBACA = true;
+          catatStatusPw(true, "");
+          return mv.slice(0, 200);
         }
       }
     }
-    var sibling = el.nextElementSibling;
-    if (sibling) {
-      var siblingText = teksEl(sibling);
-      if (siblingText && siblingText.length <= 200 && !terlihatNotifikasi(siblingText)) {
-        STATUS_PW_TERBACA = true;
-        return siblingText;
-      }
+    // Fallback utama: password muncul sebagai TEKS DI BAWAH TOMBOL CHECK, bukan di
+    // tabel berlabel "Status". Semua logika tabel di atas jadi tidak berguna untuk
+    // halaman ini. Lihat bacaPasswordDiBawahTombol().
+    var bawah = bacaPasswordDiBawahTombol();
+    if (bawah) {
+      STATUS_PW_TERBACA = true;
+      catatStatusPw(true, "");
+      return bawah;
     }
-    var text = teksEl(el);
-    var match = text.match(/status(?:\s+(?:password|pelanggan))?\s*[:\-]\s*(.+)$/i);
-    if (match && match[1]) {
-      var mv = match[1].trim();
-      if (!terlihatNotifikasi(mv)) {
-        STATUS_PW_TERBACA = true;
-        return mv.slice(0, 200);
-      }
-    }
+    alasan.push("tidak ada label status, dan tidak ada teks hasil di bawah tombol Check");
+    catatStatusPw(false, ringkasAlasan(alasan));
     return "";
   }
 
-  // Poll status password sampai muncul. Tabel status sering menyusul beberapa detik
-  // setelah render utama; versi lama hanya memberi satu kesempatan 2 dtk lalu menyerah
-  // dan caption berbunyi "Status belum terbaca saat diambil. Lihat fotonya."
+  // Password Check Gladius memunculkan password sebagai teks polos tepat DI BAWAH tombol
+  // "Check" begitu nomor dikirim — tidak pernah sebagai tabel berlabel "Status".
+  //
+  // Strategi: pakai posisi, bukan nama class/id, karena markup-nya tidak kita adopter.
+  // Kumpulkan elemen yang rect-nya DI BAWAH tombol dan sedekat mungkin dengannya, lalu
+  // ambil teks daun pertama yang bukan navigasi/footer/penjelasan.
+  var BUANG_TEKS_BAWAH =
+    /^(pemberitahuan|copyright|all rights|faq|contact us|log in|logout|home|dashboard|terms|privacy|help|support|cara pakai|©|\d{4}\s*[-–])/i;
+
+  function bacaPasswordDiBawahTombol() {
+    var btn = cariTeks(TEKS_TOMBOL_PASSWORD, true) || cariTeks("Check", true);
+    if (!btn || !terlihatReally(btn)) return "";
+    var rbT = rectDiHalaman(btn);
+
+    // Kandidat: elemen daun yang muncul di bawah tombol.
+    var semua = qsSemua(document, "div, span, p, td, dd, li, b, strong, h3, h4, code, font");
+    var best = null, bestSkor = -1;
+    for (var i = 0; i < semua.length; i++) {
+      var el = semua[i];
+      // Elemen daun saja: yang punya elemen anak berteks berarti container, bukan nilai.
+      var anakTeks = 0;
+      var kids = el.children;
+      for (var k = 0; k < kids.length; k++) {
+        if (normTeks(kids[k].textContent)) anakTeks++;
+      }
+      if (anakTeks > 0) continue;
+      if (!terlihatReally(el)) continue;
+      var t = normTeks(el.innerText || el.textContent);
+      if (!t || t.length > 120) continue;
+      if (BUANG_TEKS_BAWAH.test(t)) continue;
+      if (POLA_TIDAK_DITEMUKAN.test(t)) continue;
+      // Jangan ambil teks tombol atau input yang lagi diketik.
+      if (el.closest("form") && el.querySelector("input, select, textarea, button")) continue;
+      var r = rectDiHalaman(el);
+      // Harus benar-benar DI BAWAH tombol, dan sedekat mungkin (jarak vertikal kecil).
+      var dy = r.top - rbT.bottom;
+      if (dy < -4) continue;
+      if (dy > 600) continue;
+      // Prioritaskan yang paling dekat ke tombol, lalu yang paling pendek (nilai, bukan paragraf).
+      var skor = dy + Math.max(0, t.length - 40);
+      if (skor < bestSkor) { bestSkor = skor; best = t; }
+    }
+    if (!best) return "";
+    // Buang label yang menempel: "Password: abc" -> "abc".
+    var m = best.match(/password\s*[:\-]?\s*(.+)$/i);
+    if (m && m[1]) best = normTeks(m[1]);
+    if (!best) return "";
+    log("Password ditemukan di bawah tombol Check: '" + best + "'");
+    return best.slice(0, 200);
+  }
+
+  // Alasan yang dikumpulkan panjang sekali saat polling 500ms; ambil yang paling
+  // informatif (yang terakhir) supaya log tidak berputar isi yang sama.
+  function ringkasAlasan(alasan) {
+    if (!alasan || !alasan.length) return "tidak ada kandidat sama sekali";
+    var unik = [];
+    for (var i = alasan.length - 1; i >= 0 && unik.length < 3; i--) {
+      if (unik.indexOf(alasan[i]) < 0) unik.unshift(alasan[i]);
+    }
+    return unik.join("; ");
+  }
+
+  // Poll status password sampai muncul. Password muncul SEKETIKA setelah Check diklik
+  // (teks polos di bawah tombol), jadi 8 dtk sudah sangat longgar — sisa waktu hanya
+  // untuk kasus tabel yang merender lambat.
   async function tungguStatusPassword(maxMs) {
-    maxMs = maxMs || 30000;
+    maxMs = maxMs || 8000;
     var mulai = Date.now();
     while (Date.now() - mulai < maxMs) {
       var s = bacaStatusPassword();
       if (s) return s;
-      if (dialogMenyatakanKosong()) return "";
+      if (dialogMenyatakanKosong()) {
+        catatStatusPw(false, "halaman menyatakan data tidak ditemukan (dialog)");
+        return "";
+      }
       await wait(500);
     }
-    return bacaStatusPassword();
+    var akhir = bacaStatusPassword();
+    if (!akhir) {
+      // Kehabisan waktu tanpa satu baris log adalah kegagalan diam: dari luar tidak
+      // bisa dibedakan "tabelnya belum selesai render" dari "selektor kita salah".
+      log("Status password tidak terbaca dalam " + maxMs + "ms. Alasan terakhir: " +
+        (_alasanStatusPw || "(tidak ada)") + ". Struktur tabel di halaman:");
+      try {
+        log("Struktur 'status' di halaman: " + JSON.stringify(mtgStrukturPassword(), null, 1));
+      } catch (e) { log("Gagal ambil struktur: " + e); }
+    }
+    return akhir;
   }
 
   function maskPasswordValues() {
@@ -1197,11 +1571,11 @@
       log("Password: resume dari step " + st.step + ", tunggu tenang " + WAIT_PASSWORD_MS + "ms.");
       await tungguTenang(WAIT_PASSWORD_MS, basis);
     }
-    // Tabel status sering menyusul beberapa detik setelah render utama. Beri waktu
-    // sampai 30 dtk (poll 500 ms) supaya tidak terbaca kosong lalu langsung difoto.
-    log("Password: poll status (maks 30s).");
-    var status = await tungguStatusPassword(30000);
-    log("Password: status terbaca=" + STATUS_PW_TERBACA + ", nilai=" + JSON.stringify(status).slice(0, 80));
+    // Password muncul sebagai teks di bawah tombol, jadi poll selesai begitu ada isi.
+    // Sisa timeout hanya untuk halaman yang merender lambat.
+    log("Password: poll hasil (maks 8s).");
+    var status = await tungguStatusPassword(8000);
+    log("Password: terbaca=" + STATUS_PW_TERBACA + ", nilai=" + JSON.stringify(status).slice(0, 80));
     st.status = status;
     st.status_terbaca = STATUS_PW_TERBACA;
     st.step = "password_screenshot";
@@ -1211,8 +1585,6 @@
 
   // Konfirmasi panel Last Five Usage benar-benar terbuka (tombol diklik saja belum cukup).
   // Sebelumnya: filter offsetParent membuang panel modal position:fixed (false negative),
-  // dan aturan ">60 karakter" menolak baris LFU yang panjang. Sekarang cek ukuran rect dan
-  // menolak teks "tidak ditemukan" & tombol duplikat pendek.
   function lfuSudahTerbuka() {
     if (dialogMenyatakanKosong()) return false;
     var pat = new RegExp(TEKS_TOMBOL_LFU.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
@@ -1247,7 +1619,6 @@
 
   // Poll sampai tabel Last Five Usage benar-benar ter-render. Dipanggil SEGERA setelah
   // klik (bukan setelah tungguTenang), karena panel LFU seringnya terbuka beberapa detik
-  // lalu nutup lagi — jeda di depan poll membuat jendela terbukanya terlewat.
   async function tungguLfuTerbuka(maxMs) {
     maxMs = maxMs || WAIT_LFU_MS;
     var mulai = Date.now();
@@ -1268,8 +1639,6 @@
 
     // Klik HANYA SEKALI. Gladius me-reload halaman saat tombol LFU diklik, dan tabel LFU
     // sudah ter-render di halaman hasil reload itu. Versi lama mengklik ULANG tiap resume
-    // pasca-reload → klik memicu reload, reload memicu klik lagi → loop tanpa henti sampai
-    // MAX_ATTEMPTS habis, dengan pesan "Proses terulang karena halaman reload berulang".
     if (!st.lfu_clicked && st.lfu_attempts < 2) {
       if (!klikTeks(TEKS_TOMBOL_LFU, true)) {
         // Tombol tidak ketemu → jangan diam-diam: tandai lfu_ok=false + warning,
@@ -1277,6 +1646,7 @@
         setStatus("⚠️ " + st.nomor + " · tombol Last Five Usage tidak ditemukan");
         log("LFU tidak ditemukan untuk " + st.nomor + " (screenshot tetap dikirim).");
         st.lfu_ok = false;
+        st.catatan_lfu = "Tombol Last Five Usage tidak ditemukan di halaman hasil.";
         simpanState(st);
         return lanjutKeScreenshot(bacaState() || st);
       }
@@ -1288,7 +1658,6 @@
       simpanState(st);
       // TIDAK tungguTenang di sini: panel LFU bisa kebuka lalu nutup dalam hitungan
       // detik, jadi polling harus mulai langsung. Kalau klik memicu reload → konteks ini
-      // mati dan resume 'lfu' yang melanjutkan (tidak mengklik ulang, hanya menunggu).
     } else {
       log("LFU resume: tabel sudah ada di halaman, tidak mengklik ulang.");
     }
@@ -1308,7 +1677,6 @@
   async function lanjutKeScreenshot(st) {
     // Baca ulang state tepat sebelum foto. Gladius kerap merender beberapa detik
     // setelah langkah sebelumnya, jadi caption dan foto harus berasal dari bacaan
-    // yang sama — inilah penyebab lama caption "tidak ditemukan" padahal fotonya berisi data.
     if (st.jenis === "embassy" && !st.paket_ok) {
       var p = bacaPaket();
       if (!nilaiKosong(p)) {
@@ -1320,7 +1688,6 @@
     if (st.jenis === "password") {
       // Baca ulang status tepat sebelum foto, sama seperti paket Embassy. Dulu status
       // dibaca sekali di lanjutPassword() lalu tidak pernah diperbarui, sehingga caption
-      // berbunyi "Status belum terbaca" padahal tabelnya sudah ada saat difoto.
       var sp = await tungguStatusPassword(5000);
       if (sp) {
         st.status = sp;
@@ -1331,6 +1698,18 @@
     setStatus("📸 Ambil screenshot " + st.nomor + " ...");
     var foto = await ambilSS(st.jenis);
     if (!foto) throw new Error("Screenshot kosong.");
+    // Rangkum alasan kegagalan supaya bot.py bisa menampilkan SEBABnya, bukan hanya
+    // "tidak ditemukan". Tanpa ini semua kegagalan terlihat sama dan tidak bisa
+    var alasan = st.alasan || "";
+    if (!alasan && st.jenis === "embassy" && !st.paket_ok) {
+      alasan = "Paket tidak ditemukan pada domain: " + (st.coba || []).join(", ") + ".";
+    }
+    if (!alasan && st.jenis === "embassy" && !st.lfu_ok && st.catatan_lfu) {
+      alasan = st.catatan_lfu;
+    }
+    if (!alasan && st.jenis === "password" && !st.status) {
+      alasan = "Status belum terbaca. " + (_alasanStatusPw || "");
+    }
     var payload = {
       id: st.id,
       chat_id: st.chat_id,
@@ -1340,30 +1719,128 @@
       status: st.status || "",
       status_terbaca: st.status_terbaca !== false,
       dialog: DIALOG_TERAKHIR ? DIALOG_TERAKHIR.pesan.slice(0, 200) : "",
+      alasan: alasan.slice(0, 300),
       foto: foto,
       paket_ok: !!st.paket_ok,
       lfu_ok: !!st.lfu_ok,
       waktu: fmtWaktu(),
     };
+    // Anti-duplikat: tandai SEBELUM mengirim, lalu simpan. Kalau halaman reload di tengah
+    // upload, resume akan melihat foto_dikirim dan tahu fotonya sudah ada — tanpa flag ini
+    st.foto_dikirim = true;
+    simpanState(st);
     setStatus("📤 Kirim hasil " + st.nomor + " ...");
-    var resp = await kirimHasil(payload);
-    hapusState();
-    tandaiHandled(st.id);
-    if (resp && resp.ok && resp.sent) {
-      setStatus("✅ Selesai " + st.nomor);
-      log("Hasil " + st.nomor + " terkirim.");
-    } else {
-      setStatus("🔴 Gagal kirim foto " + st.nomor);
-      log("Gagal kirim ke server bot: " + JSON.stringify(resp));
+    var resp = null;
+    for (var kirimKe = 1; kirimKe <= 3; kirimKe++) {
+      resp = await kirimHasil(payload);
+      // Putuskan dari `sent`, bukan `ok`. Endpoint membalas {"ok":true,"sent":false} kalau
+      // Telegram menolaknya (mis. bad request chat_id, foto terlalu besar). Versi lama
+      if (resp && resp.ok && resp.sent) break;
+      log("Kirim hasil percobaan " + kirimKe + "/3 gagal: " + JSON.stringify(resp));
+      await wait(1500 * kirimKe);
     }
+    if (resp && resp.ok && resp.sent) {
+      hapusState();
+      tandaiHandled(st.id, st.nomor);
+      if (resp.data_lengkap === false) {
+        setStatus("⚠️ Foto " + st.nomor + " terkirim, data tidak lengkap");
+        log("Foto " + st.nomor + " terkirim tapi data TIDAK lengkap: " + (resp.alasan || "-"));
+      } else {
+        setStatus("✅ Selesai " + st.nomor);
+        log("Hasil " + st.nomor + " terkirim lengkap.");
+      }
+      return;
+    }
+    // Gagal kirim: JANGAN tandai handled dan jangan hapus state sebelum yakin terkirim.
+    // Versi lama menghapus state + menandai handled LANGSUNG setelah memanggil kirim,
+    log("Gagal kirim ke server bot setelah 3 percobaan: " + JSON.stringify(resp) +
+      " → nomor " + st.nomor + " TIDAK ditandai selesai, akan diulang.");
+    setStatus("🔴 Gagal kirim foto " + st.nomor + " · akan diulang");
+    hapusState();
+  }
+
+  // ===================== PENYELARASAN LANGKAH DENGAN HALAMAN =====================
+
+  // Apakah ada header kolom hasil Paket di halaman? Memakai pola yang sama dengan
+  // bacaPaket() supaya "hasil sudah tampil" dan "nilai terbaca" tidak berbeda pendapat.
+  function adaJejakPaket() {
+    var pola = polaLabelPaket();
+    var akar = akarSemua();
+    for (var a = 0; a < akar.length; a++) {
+      var sel = [];
+      try { sel = qsSemua(akar[a], "td, th"); } catch (e) { continue; }
+      for (var i = 0; i < sel.length; i++) {
+        var t = normTeks(sel[i].innerText || sel[i].textContent);
+        if (t && pola.test(t)) return true;
+      }
+    }
+    return false;
+  }
+
+  function adaJejakStatus() {
+    return kumpulkanStatusPassword().length > 0;
+  }
+
+  // Akar masalah "dari menu Embassy berhasil, dari homepage gagal".
+  // Mulai dari halaman yang benar, semua berjalan normal. Mulai dari homepage, bukaHalaman
+  async function sinkronkanLangkah(st) {
+    var jenis = st.jenis;
+
+    if (jenis === "embassy") {
+      if (st.step !== "cek") return true;
+      if (!await tungguFormTugas("embassy") && !adaJejakPaket()) {
+        throw new Error("Form Embassy belum siap.");
+      }
+      if (adaJejakPaket()) return true;              // hasil sudah ada → cukup dibaca
+      if (!st.cek_clicked) {
+        // Baru sampai di halaman form lewat navigasi: isi sekarang, sebelum membaca.
+        log("Isi Nomor Internet " + st.nomor + " (resume, form baru dimuat dari navigasi).");
+      } else if (nomorMasihTerisi(st.nomor)) {
+        // Sudah pernah diklik dan kolomnya masih berisi nomornya: bukan form kosong,
+        // jangan klik lagi (klik berulang itulah yang memicu reload tanpa akhir).
+        return true;
+      } else {
+        log("Resume: halaman kembali ke form kosong (cek_clicked=true) → ulangi Cek.");
+      }
+      if (!isiNomor(st.nomor)) {
+        throw new Error("Gagal mengisi Nomor Internet (kolom tidak ditemukan atau nilai tidak terverifikasi).");
+      }
+      if (!klikTeks(TEKS_TOMBOL_CEK, true)) {
+        throw new Error("Tombol '" + TEKS_TOMBOL_CEK + "' tidak ditemukan.");
+      }
+      st.cek_clicked = true;
+      simpanState(st);
+      await tungguTenang(WAIT_HASIL_MS, sidikJari());
+      return true;
+    }
+
+    // PASSWORD
+    if (st.step === "password_cek") {
+      if (!await tungguFormTugas("password")) {
+        throw new Error("Form Password Check belum siap.");
+      }
+      return true;
+    }
+    if (st.step === "password_hasil") {
+      if (adaJejakStatus()) return true;                 // hasil sudah tampil
+      if (nomorMasihTerisi(st.nomor)) return true;        // form sudah terisi, tunggu saja
+      // Kita mendarat di form kosong padahal state bilang "sudah diklik". Kembalikan
+      // langkah ke awal agar lanjutPassword() mengisi nomor dan menekan Cek lagi.
+      log("Resume: halaman kembali ke form kosong di step password_hasil → ulangi Cek Password.");
+      st.step = "password_cek";
+      simpanState(st);
+    }
+    return true;
   }
 
   // Dipanggil saat script (baru) terbangun setelah reload — lanjut dari checkpoint.
   async function cobaResumeSetelahReload() {
     var st = bacaState();
     if (!st) return false;
-    if (sudahHandled(st.id)) { hapusState(); return false; }
+    if (sudahHandled(st.id, st.nomor)) { hapusState(); return false; }
     st.jenis = st.jenis === "password" ? "password" : "embassy";
+    // Resume masih task yang sama, jadi dialog TIDAK direset di sini: dialog yang
+    // baru saja muncul justru informasi yang mungkin baru kita perlukan. Dialog antar
     st.resume = (st.resume || 0) + 1;
     simpanState(st);
     // Tugas sebelumnya sudah GAGAL, tapi laporannya belum sampai ke bot. Coba ulang HANYA
@@ -1391,8 +1868,6 @@
     }
     // Tiga batas independen: percobaan domain, reload yang DIAKIBATKAN klik kita, dan
     // jumlah kebangunan script (jaring pengaman untuk auto-refresh tak terduga Gladius).
-    // Dulu hanya ada satu batas (st.resume >= MAX_ATTEMPTS) sehingga reload normal pun
-    // ikut menghabiskan anggaran dan tugas gagal padahal masih sehat.
     if (
       st.attempts >= MAX_ATTEMPTS ||
       (st.reload_ours || 0) > MAX_ATTEMPTS ||
@@ -1414,8 +1889,6 @@
       if (navigasi !== "ready") {
         // location.assign selalu meninggalkan konteks ini (halaman reload). Kalau kita
         // sampai di sini BERULANG tanpa pernah mendarat di halaman target, berarti sesi
-        // Gladius sudah habis dan halaman memantul ke login. Hitung lalu berhenti --
-        // jangan biarkan tak terbatas, dan jangan keluar diam-diam tanpa jejak.
         st.nav = (st.nav || 0) + 1;
         simpanState(st);
         if (st.nav >= 3) {
@@ -1429,32 +1902,12 @@
       }
       st.nav = 0;
       simpanState(st);
-      if (st.jenis === "password" && st.step === "password_cek") {
-        if (!await tungguFormTugas(st.jenis)) {
-          throw new Error("Form Password Check belum siap.");
-        }
-      } else if (st.jenis === "embassy" && st.step === "cek") {
-        if (!await tungguFormTugas(st.jenis)) {
-          throw new Error("Form Embassy belum siap.");
-        }
-        // st.cek_clicked belum true → kita BARU sampai di halaman form lewat location.assign
-        // dari prosesSatu (mis. mulai dari homepage). Nomor belum pernah diisi, jadi isi
-        // sekarang juga SEBELUM lanjutDariCek. Tanpa blok ini, alur dari homepage menunggu
-        // hasil 30 detik lalu mengklik Cek dengan kolom kosong. Jalur yang kebetulan sudah
-        // berada di halaman form tidak butuh ini karena prosesSatu yang mengisinya.
-        if (!st.cek_clicked) {
-          log("Isi Nomor Internet " + st.nomor + " (resume, form baru dimuat dari navigasi).");
-          if (!isiNomor(st.nomor)) {
-            throw new Error("Gagal mengisi Nomor Internet (kolom tidak ditemukan atau nilai tidak terverifikasi).");
-          }
-          if (!klikTeks(TEKS_TOMBOL_CEK, true)) {
-            throw new Error("Tombol '" + TEKS_TOMBOL_CEK + "' tidak ditemukan.");
-          }
-          st.cek_clicked = true;
-          simpanState(st);
-          await tungguTenang(WAIT_HASIL_MS, sidikJari());
-        }
+      // Foto sudah diambil dan sudah dicoba kirim sebelum halaman ini me-reload. Jangan
+      // memotret ulang (duplikat ke user); coba kirim ulang saja. Foto tidak disimpan di
+      if (st.foto_dikirim) {
+        log("Foto " + st.nomor + " sudah pernah diambil sebelum reload → jangan potret ulang.");
       }
+      await sinkronkanLangkah(st);
       if (st.jenis === "password") {
         await lanjutPassword(st);
       } else if (st.step === "lfu") {
@@ -1476,19 +1929,69 @@
 
   // Pemakaian html2canvas. Script-nya sendiri datang dari @require (lihat catatan di
   // bagian atas file), jadi tidak ada lagi unduhan runtime dari CDN.
-  //
-  // PENTING: guard WAJIB mengecek "function", bukan sekadar "ada". Dulu guard-nya
-  // `typeof window.html2canvas !== "undefined"`, yang lolos untuk stub non-fungsi lalu
-  // meledak jadi "TypeError: window.html2canvas is not a function" tepat di baris
-  // pemanggilannya. Cek "function" membuat kegagalan jadi kalimat Indonesia yang jelas.
   function html2canvasFn() {
     if (typeof window.html2canvas === "function") return window.html2canvas;
     if (H2C_ASLI) return H2C_ASLI; // jaring pengaman bila halaman menimpanya
     return null;
   }
 
-  function html2canvasSiap() {
-    return html2canvasFn() !== null;
+  // Sembunyikan badge kita sendiri sebelum memotret, laluembalikan apa adanya: foto dikirim
+  // ke Telegram sebagai bukti, jadi badge "idle" yang ikut tampil akan terlihat di hasil.
+  function sembunyikanUI() {
+    var ids = ["getembassy-ui", "getembassy-logbox"];
+    var tersembunyi = [];
+    for (var i = 0; i < ids.length; i++) {
+      var el = document.getElementById(ids[i]);
+      if (!el) continue;
+      el.__geDisplayLama = el.style.display;
+      el.style.display = "none";
+      tersembunyi.push(el);
+    }
+    return function () {
+      for (var i = 0; i < tersembunyi.length; i++) {
+        tersembunyi[i].style.display = tersembunyi[i].__geDisplayLama || "";
+        tersembunyi[i].__geDisplayLama = null;
+      }
+    };
+  }
+
+  var PIXEL_TRANSPARAN =
+    "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+
+  // Gladius menyisipkan <img src="http://graph_image.php/?action=zoom&...">. Perhatikan
+  // itu URL ABSOLUT tanpa host: skema http://, lalu "graph_image.php" dianggap sebagai
+  function netralkanGambarRusak() {
+    var tersentuh = [];
+    var akar = akarSemua();
+    for (var a = 0; a < akar.length; a++) {
+      var imgs = [];
+      try { imgs = qsSemua(akar[a], "img"); } catch (e) { continue; }
+      for (var i = 0; i < imgs.length; i++) {
+        var im = imgs[i];
+        var attr = im.getAttribute("src") || "";
+        // Sudah gagal total: selesai tapi nol lebar. Ini kondisi yang dijamin salah.
+        var gagal = im.complete && im.naturalWidth === 0;
+        // Mixed content: http:// pada halaman https:// pasti dinaikkan ke host palsu.
+        var httpMurni = /^http:\/\//i.test(attr);
+        if (!gagal && !httpMurni) continue;
+        tersentuh.push({ el: im, src: attr, srcset: im.getAttribute("srcset") });
+        im.removeAttribute("srcset");
+        im.removeAttribute("sizes");
+        im.setAttribute("src", PIXEL_TRANSPARAN);
+      }
+    }
+    if (tersentuh.length) {
+      log("Netralkan " + tersentuh.length + " gambar rusak sebelum screenshot: " +
+        tersentuh.map(function (t) { return t.src.slice(0, 60); }).join(" | ").slice(0, 200));
+    }
+    return function () {
+      for (var i = 0; i < tersentuh.length; i++) {
+        var t = tersentuh[i];
+        if (!t.el) continue;
+        t.el.setAttribute("src", t.src);
+        if (t.srcset) t.el.setAttribute("srcset", t.srcset);
+      }
+    };
   }
 
   async function ambilSS(jenis) {
@@ -1519,8 +2022,6 @@
     if (!box) box = { left: 0, top: 0, right: w, bottom: h };
     // Dialog native membekukan halaman; html2canvas butuh event loop bebas supaya tidak
     // menghasilkan canvas setengah jadi (halaman tampak utuh tapi banyak area putih).
-    // Versi lama memanggil ulang dirinya sendiri dari dalam executor Promise -> hasilnya
-    // dibuang dan Promise luar tidak pernah selesai (menggantung). Sekarang cukup loop.
     var tungguDialog = 0;
     while (!dialogTua(500) && tungguDialog < 30) {
       await wait(500);
@@ -1528,6 +2029,8 @@
     }
     try { window.scrollTo(0, box.top); } catch (e) {}
     var dataUrl;
+    var restoreUI = sembunyikanUI();
+    var restoreGambar = netralkanGambarRusak();
     try {
       dataUrl = await new Promise(function (resolve, reject) {
         // Penjaga terakhir: kalau regresi lagi, errornya harus kalimat yang jelas, bukan
@@ -1549,11 +2052,18 @@
           windowHeight: h,
           backgroundColor: "#ffffff",
           logging: false,
+          // Batas keras untuk satu gambar. Default html2canvas 15000ms per gambar, jadi
+          // beberapa gambar yang lambat bisa menunda screenshot puluhan detik. Dengan
+          imageTimeout: 4000,
         }).then(function (canvas) {
           resolve(canvas.toDataURL("image/png"));
         }).catch(reject);
       });
     } finally {
+      // Urutan penting: badge lebih dulu, baru blur password. Kalau blur yang lebih dulu
+      // dan html2canvas sudah memotret DOM, badge tetap muncul di hasil.
+      restoreUI();
+      restoreGambar();
       restore();
     }
     return dataUrl.indexOf(",") >= 0 ? dataUrl.split(",")[1] : "";
@@ -1566,6 +2076,18 @@
     return new Promise(function (resolve) {
       function selesai(body, err) {
         reqAktif = Math.max(0, reqAktif - 1);
+        if (err) {
+          // Cegah spam: /antrian dipoll tiap 5 dtk, log tiap kegagalan akan menyingkirkan
+          // 300 baris berguna dalam ~25 menit. Catat yang pertama lalu setiap ke-20.
+          _gagalHttp++;
+          if (_gagalHttp === 1 || _gagalHttp % 20 === 0) {
+            log("HTTP " + (opt.method || "GET") + " " + urlPendek(opt.url) + " → " + err +
+              " (gagal beruntun ke-" + _gagalHttp + ")" +
+              (err === "timeout" ? " — bot.py hidup? PORT " + PORT_HTTP + " benar?" : ""));
+          }
+        } else {
+          _gagalHttp = 0;
+        }
         resolve({ body: body, err: err });
       }
       if (typeof GM_xmlhttpRequest !== "undefined") {
@@ -1598,18 +2120,41 @@
   async function ambilAntrian() {
     var url = SERVER_BOT + "/antrian?secret=" + encodeURIComponent(AGENT_SECRET);
     var res = await reqGM({ url: url, timeout: 20000 });
-    if (res.err) return [];
+    if (res.err) {
+      // Dulu kondisi ini dan "antrian kosong" sama-sama mengembalikan [], sehingga
+      // bot mati total terlihat identik dengan bot sedang menganggur. Pisahkan sekarang.
+      _antrianGagal++;
+      if (_antrianGagal === 1 || _antrianGagal % 10 === 0) {
+        log("Antrian: GAGAL mengambil dari server bot (" + res.err + "), ke-" +
+          _antrianGagal + " berturut-turut.");
+      }
+      return [];
+    }
     try {
       var j = JSON.parse(res.body);
-      return (j && j.items) || [];
+      _antrianGagal = 0;
+      if (j && j.ok === false) {
+        log("Antrian: server menolak permintaan → " + (j.error || "(tanpa pesan)") +
+          " (secret tidak sama dengan bot.py?)");
+        return [];
+      }
+      var isi = (j && j.items) || [];
+      if (isi.length > 0) {
+        log("Antrian: " + isi.length + " item → " + isi.map(function (x) {
+          return x.id + " " + x.jenis + " " + x.nomor;
+        }).join(" | "));
+      }
+      return isi;
     } catch (e) {
+      _antrianGagal++;
+      log("Antrian: respons bot bukan JSON (awal: " + String(res.body || "").slice(0, 100) +
+        ") — bot.py mungkin tidak jalan atau port salah.");
       return [];
     }
   }
 
   // Timeout dibuat jauh di atas durasi unggah bot (bot.py pakai requests timeout=120).
   // Nilai lama 30s pasti kalah untuk foto besar -> ConnectionAbortedError -> badge
-  // "Gagal kirim" padahal foto sudah sampai ke Telegram.
   var KIRIM_TIMEOUT_MS = 180000;
 
   async function kirimHasil(payload) {
@@ -1622,15 +2167,20 @@
       headers: { "Content-Type": "application/json" },
       timeout: KIRIM_TIMEOUT_MS,
     });
+    // Bedakan "server menjawab error" dari "server tidak menjawab sama sekali". Versi
+    // lama membuang res.err, jadi timeout dan 403 sama-sama muncul sebagai {ok:false}
+    if (res.err) return { ok: false, error: "tidak ada respons dari bot.py (" + res.err + ")" };
     try { return JSON.parse(res.body); }
-    catch (e) { return { ok: false }; }
+    catch (e) {
+      return {
+        ok: false,
+        error: "respons bot.py bukan JSON: " + String(res.body || "").slice(0, 120),
+      };
+    }
   }
 
   // reqGM tidak pernah reject -- ia selalu resolve dengan {body, err}, apa pun yang terjadi
   // (404, DNS gagal, timeout). Versi lama membuang respons itu apa adanya, sehingga laporan
-  // "/selesai" yang gagal sampai ke bot tidak pernah ketahuan. Akibatnya task tetap "pending"
-  // selamanya di antrian bot sementara userscript sudah hapus state-nya -> Telegram
-  // menggantung padahal tidak ada yang mau memproses lagi.
   async function laporGagal(payload) {
     sentuhAktivitas();
     var url = SERVER_BOT + "/selesai?secret=" + encodeURIComponent(AGENT_SECRET);
@@ -1660,9 +2210,6 @@
 
   // Lapor kegagalan ke bot lalu bersihkan state -- TAPI hanya kalau laporannya benar-benar
   // sampai. Kalau laporan gagal (jaringan berfluktuasi), state sengaja disimpan dan ditandai
-  // agar siklus berikutnya mencoba mengulang HANYA laporan ini, bukan mengulang seluruh
-  // proses dari nol. Tanpa ini satu hiccup jaringan = satu request menggantung di Telegram
-  // sampai _pantau_timeout menyala beberapa menit kemudian.
   async function gagalkan(st, pesan) {
     var potong = String(pesan).slice(0, 200);
     var ok = await laporGagal({
@@ -1695,11 +2242,9 @@
   var terakhirAktivitas = Date.now();
   // Jumlah request HTTP ke server bot yang sedang berjalan.
   var reqAktif = 0;
-  var statusEl = null, toggleBtn = null;
+  var statusEl = null, toggleBtn = null, logBtn = null;
   // Pesan status ditahan sebentar sebelum kembali ke "idle". Versi lama memanggil
   // updateTampilanAuto() dari blok finally setiap task, dan fungsi itu langsung menimpa
-  // status dengan "idle" -- sehingga pesan penting seperti "Gagal proses" atau
-  // "paket terbaca" nyaris tak pernah sempat terbaca di layar.
   var STATUS_TAHAN_MS = 5000;
   var jedaResetStatus = null;
 
@@ -1745,6 +2290,41 @@
     }, STATUS_TAHAN_MS);
   }
 
+  // Tombol "📋": salin seluruh log yang bertahan melewati reload, supaya tidak perlu
+  // DevTools sama sekali (DevTools ikut ke-clear tiap Gladius me-refresh).
+  function salinLog() {
+    var teks = "[GetEmbassy] log " + new Date().toLocaleString("id-ID") + "\n" +
+      "URL: " + location.pathname + "\n" + ambilLog();
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(teks).then(function () {
+        setStatus("📋 Log dicopy (" + teks.length + " karakter)");
+      }).catch(function () { tampilkanLogJendela(teks); });
+    } else {
+      tampilkanLogJendela(teks);
+    }
+  }
+
+  // Cadangan kalau Clipboard API ditolak (konteks tidak aman / izin ditolak): tampilkan
+  // log di textarea yang bisa dicari dan dicopy manual.
+  function tampilkanLogJendela(teks) {
+    try {
+      var lama = document.getElementById("getembassy-logbox");
+      if (lama) lama.remove();
+      var ta = document.createElement("textarea");
+      ta.id = "getembassy-logbox";
+      ta.value = teks;
+      ta.style.cssText =
+        "position:fixed;left:16px;top:16px;width:72vw;height:70vh;z-index:1000000;" +
+        "font-family:Consolas,monospace;font-size:11px;padding:8px;background:#fff;";
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      setStatus("📋 Log ditampilkan (clipboard ditolak)");
+    } catch (e) {
+      setStatus("🔴 Gagal tampilkan log: " + e);
+    }
+  }
+
   function buatUI() {
     if (document.getElementById("getembassy-ui")) return;
     if (!document.body) { setTimeout(buatUI, 300); return; }
@@ -1769,6 +2349,14 @@
       "font-weight:700;color:#fff;box-shadow:0 2px 8px rgba(0,0,0,.25);";
     toggleBtn.addEventListener("click", toggleAuto);
     wadah.appendChild(toggleBtn);
+
+    logBtn = document.createElement("button");
+    logBtn.id = "getembassy-log";
+    logBtn.style.cssText =
+      "border:none;cursor:pointer;border-radius:16px;padding:6px 12px;font-size:12px;" +
+      "font-weight:700;color:#fff;background:#1565c0;box-shadow:0 2px 8px rgba(0,0,0,.25);";
+    logBtn.addEventListener("click", salinLog);
+    wadah.appendChild(logBtn);
 
     document.body.appendChild(wadah);
     updateTampilanAuto();
@@ -1796,18 +2384,74 @@
     tulisStatus("🟢 GetEmbassy: idle");
   }
 
+  // ===================== WATCHDOG KEMAJUAN =====================
+
+  // Kalau ada state tapi TIDAK BERUBAH sama sekali selama banyak siklus, prosesnya
+  // macet — bukan sekadar lambat. Keadaan ini dulu tidak terlihat dari luar: loop tetap
+  var SIKLUS_MACET = 12; // ~60 dtk pada POLL_INTERVAL_DETIK = 5
+  var _sidikMacet = null;
+  var _siklusMacet = 0;
+
+  function sidikState(st) {
+    if (!st) return "(tidak ada state)";
+    return [st.id, st.step, st.attempts, st.resume, st.nav, st.reload_ours,
+      st.paket_ok, st.lfu_ok, st.cek_clicked, st.password_clicked].join("|");
+  }
+
+  async function periksaMacet(st) {
+    if (!st) {
+      _siklusMacet = 0;
+      _sidikMacet = null;
+      return;
+    }
+    var sidik = sidikState(st);
+    if (sidik !== _sidikMacet) {
+      _sidikMacet = sidik;
+      _siklusMacet = 0;
+      return;
+    }
+    _siklusMacet++;
+    if (_siklusMacet < SIKLUS_MACET) return;
+    var detik = Math.round(_siklusMacet * POLL_INTERVAL_DETIK);
+    if (_siklusMacet === SIKLUS_MACET) {
+      log("⚠️ MACET terdeteksi: state " + st.id + " tidak berubah selama " +
+        _siklusMacet + " siklus (~" + detik + " dtk), step '" + st.step +
+        "'. Halaman sekarang " + pathSekarang() + ", target " + pathTarget(st.jenis) +
+        ". Beri 2 siklus lagi sebelum menyerah.");
+    }
+    if (_siklusMacet <= SIKLUS_MACET + 2) return;
+    _siklusMacet = 0;
+    _sidikMacet = null;
+    log("Menyerah: state " + st.id + " macet di step '" + st.step + "' (" + detik + " dtk tanpa perubahan).");
+    await gagalkan(st, "Proses macet: halaman Gladius tidak berubah selama " + detik +
+      " detik pada langkah '" + st.step + "'. Cek manual atau login ulang.");
+  }
+
   // ===================== LOOP UTAMA =====================
 
   async function prosesSatu(task) {
     if (!autoAktif) return false;
-    if (sudahHandled(task.id)) return false;
+    if (sudahHandled(task.id, task.nomor)) return false;
     var stateAda = bacaState();
     if (stateAda) {
-      if (sudahHandled(stateAda.id)) hapusState();
-      else return false;
+      if (sudahHandled(stateAda.id, stateAda.nomor)) {
+        hapusState();
+      } else if (stateAda.id === task.id) {
+        // State milik task yang SAMA → ini kelanjutan, bukan tabrakan. Versi lama
+        // `return false` apa pun keadaannya, sehingga ketika halaman sedang salah
+        log("State milik task ini juga ada (step " + stateAda.step + "), lanjut dari checkpoint.");
+      } else {
+        // State milik task LAIN: jangan mulai task baru di atasnya, tapi jangan juga
+        // keluar tanpa jejak.
+        log("Menunda task " + task.id + ": masih ada state task " + stateAda.id +
+          " (step " + stateAda.step + ").");
+        return false;
+      }
     }
     var jenis = task.jenis === "password" ? "password" : "embassy";
     var perluNavigasi = false;
+    // Dialog dari task sebelumnya tidak boleh ikut terbawa (lihat resetDialog).
+    resetDialog(task.nomor);
     idAktif = task.id;
     lagiProses = true;
     log("Proses antrian " + task.id + " jenis " + jenis + " nomor " + task.nomor);
@@ -1831,6 +2475,12 @@
       if (navigasi !== "ready") {
         perluNavigasi = true;
         return true;
+      }
+      // Sesi bisa saja habis TEPAT saat navigasi (Gladius lempar ke login). Jangan
+      // lanjut mengisi form: lapor saja, lalu tunggu login ulang.
+      if (sesiTdkValid()) {
+        await stopkarenaSesiHabis(st);
+        return false;
       }
       if (!await tungguFormTugas(jenis)) {
         throw new Error(
@@ -1870,7 +2520,6 @@
 
   // Reload penjaga: menembak HANYA bila tab sunyi total selama SESI_SUNYI_MS dan tidak
   // ada pekerjaan berjalan. Poll /antrian tiap 5 dtk tidak dihitung sebagai aktivitas,
-  // jadi pengawasan tetap jalan tanpa membuat sesi Gladius kedaluwarsa.
   async function jagaSesi() {
     if (Date.now() - terakhirAktivitas < SESI_SUNYI_MS) return;
     if (reqAktif > 0) return;
@@ -1883,14 +2532,26 @@
     location.reload();
   }
 
-  async function loopSiklus() {
-    while (autoAktif) {
+  async function loopSiklus() {    while (autoAktif) {
       try {
+        // Cek sesi PALING AWAL, sebelum apa pun. Selama sesi habis, semua task akan
+        // gagal dengan sebab yang sama, jadi jangan mulai satu pun.
+        if (sesiTdkValid()) {
+          await stopkarenaSesiHabis(bacaState());
+          await tidur(SESI_HABIS_TUNGGU_MS);
+          continue;
+        }
+        // Sesi sudah kembali (kamu baru saja login). Reset penandanya supaya bot
+        // lanjut 정상 dari antrian.
+        if (SESI_HABIS_ATAS) {
+          SESI_HABIS_ATAS = false;
+          setStatus("🟢 Sesi Gladius kembali — lanjut antrian");
+          log("Sesi Gladius kembali normal, lanjut proses antrian.");
+        }
         await jagaSesi();
         var items = await ambilAntrian();
-        if (items.length > 0) log("Antrian: " + items.length + " item");
         var stateAntrian = bacaState();
-        if (stateAntrian && !sudahHandled(stateAntrian.id)) {
+        if (stateAntrian && !sudahHandled(stateAntrian.id, stateAntrian.nomor)) {
           var masihPending = false;
           for (var si = 0; si < items.length; si++) {
             if (items[si].id === stateAntrian.id) { masihPending = true; break; }
@@ -1898,27 +2559,27 @@
           if (!masihPending) hapusState();
         }
         var stateLanjut = bacaState();
-        if (
-          stateLanjut &&
-          !sudahHandled(stateLanjut.id) &&
-          !idAktif &&
-          diHalamanTarget(stateLanjut.jenis)
-        ) {
+        if (stateLanjut && !sudahHandled(stateLanjut.id, stateLanjut.nomor) && !idAktif) {
+          // Syarat diHalamanTarget() DIHAPUS di sini. Pempulih lanjutan
+          // (cobaResumeSetelahReload) sudah memanggil bukaHalaman() sendiri, jadi aman
           await cobaResumeSetelahReload();
+          // Watchdog harus jalan SETELAH resume juga, bukan hanya di jalur tanpa state.
+          // Versi lama menaruh periksaMacet() sesudah blok ini yang selalu `continue`,
+          await periksaMacet(bacaState());
           // Jangan biarkan resume mengunci loop penuh (continue di atas melompati
           // tidur(POLL_INTERVAL_DETIK) di bawah). Bila resume gagal berkemajuan dan
-          // tidak menghapus state, tanpa jeda ini ia dipanggil ulang beruntun dan
-          // membakar anggaran resume/reload dengan cepat.
           await tidur(1500);
           continue;
         }
+        await periksaMacet(bacaState());
         for (var i = 0; i < items.length; i++) {
           if (!autoAktif) break;
           var it = items[i];
-          if (sudahHandled(it.id)) continue;
+          if (sudahHandled(it.id, it.nomor)) continue;
           if (idAktif && it.id === idAktif) continue;
           var stateSekarang = bacaState();
-          if (stateSekarang && !sudahHandled(stateSekarang.id) && stateSekarang.id !== it.id) continue;
+          if (stateSekarang && !sudahHandled(stateSekarang.id, stateSekarang.nomor) &&
+              stateSekarang.id !== it.id) continue;
           var pindah = await prosesSatu(it);
           if (pindah) break;
           if (autoAktif) await tidur(1500);
