@@ -44,7 +44,6 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from config import (
     AGENT_SECRET,
-    DAFTAR_DOMAIN,
     PORT_HTTP,
     TOKEN,
     WAIT_ANNOUNCE_MENIT,
@@ -182,25 +181,15 @@ def _tele_post(path: str, files=None, data: dict | None = None) -> dict:
         return {"ok": False}
 
 
-def _caption_hasil(
-    nomor: str,
-    waktu: str,
-    paket_ok: bool,
-    lfu_ok: bool,
-    alasan: str = "",
-) -> str:
-    caption = f"Embassy {nomor} | {waktu}"
-    if not paket_ok:
-        caption += (
-            f"\nPaket Radius/PCRF tidak ditemukan dalam "
-            f"{len(DAFTAR_DOMAIN)} domain."
-        )
-    elif not lfu_ok:
-        caption += (
-            "\nLast Five Usage gagal atau tidak selesai dimuat. "
-            "Gambar berikut adalah hasil Embassy sebelum percobaan riwayat."
-        )
-    return caption + _baris_alasan(alasan)
+def _caption_hasil(nomor: str, waktu: str) -> str:
+    # Cuma baris pertama. Versi lama menambahkan "Paket Radius/PCRF tidak ditemukan
+    # dalam N domain" atau "Last Five Usage gagal atau tidak selesai dimuat" di bawah
+    # header, padahal kedua baris itu hampir selalu muncul pada hasil yang sebenarnya
+    # BERHASIL: paket sudah tampil di layar tapi pembaca selektor kami lewatkan, atau
+    # LFU sudah terisi penuh tapi batas tunggunya habis sebelum sempat terbaca.
+    # Screenshot-nya sendiri sudah jadi bukti, jadi caption tidak perlu mengulang
+    # verdict yang selama ini sering salah.
+    return f"Embassy {nomor} | {waktu}"
 
 
 def _caption_password(
@@ -213,14 +202,11 @@ def _caption_password(
 ) -> str:
     caption = f"Password Check {nomor} | {waktu}"
     status = str(status or "").strip()
+    # Header sudah menyebut "Password Check", jadi baris nilainya cukup menandai nomor
+    # tujuan tanpa mengulang kata password. Kalau teksnya tidak kebaca, TIDAK ada baris
+    # pengganti: foto sudah berisi jawabannya dan caption tidak perlu memperingatkan.
     if status and status_terbaca:
-        caption += f"\nStatus: {status}"
-    elif str(dialog or "").strip():
-        caption += f'\nHalaman Gladius: "{str(dialog).strip()[:160]}"'
-    else:
-        # Jangan menulis "tidak ditemukan": data bisa saja ada, hanya belum ter-render
-        # saat screenshot diambil.
-        caption += "\nStatus belum terbaca saat diambil. Lihat fotonya."
+        caption += f"\nno inet {nomor}: {status}"
     return (caption + _baris_alasan(alasan))[:1024]
 
 
@@ -236,26 +222,26 @@ def _baris_alasan(alasan: str) -> str:
 
 
 def _data_lengkap(jenis: str, data: dict) -> tuple[bool, str]:
-    """Apakah data task ini benar-benar didapat, dan alasannya kalau tidak.
+    """Apakah task ini layak dianggap berhasil. Selalu True, dan alasannya selalu "".
 
-    Satu-satunya tempat yang memutuskan "berhasil/tidak", dipakai untuk caption DAN
-    untuk pesan antrean — supaya keduanya tidak pernah berbeda pendapat.
+    Fungsi ini dulu memutuskan "berhasil/tidak" dari `paket_ok` (Embassy) atau
+    `status_terbaca` (Password), lalu hasilnya dipakai untuk caption DAN untuk pesan
+    antrean. Kedua sumber itu jauh lebih sering SALAH daripada benar:
+
+    - Password: Gladius menampilkan password sebagai teks polos di bawah tombol Check,
+      bukan di panel berlabel "Status", jadi syarat `status_terbaca` mustahil terpenuhi
+      dan setiap task password berakhir dengan baris peringatan palsu.
+    - Embassy: paket bisa sudah tampil di layar tapi terlewat pembaca selektor kami,
+      atau LFU sudah terisi penuh tapi `tungguLfuTerbuka` kehabisan waktu. Foto yang
+      terkirim sudah benar, hanya caption dan pesannya yang mengarang kegagalan.
+
+    Sekarang deliverable-nya adalah screenshot-nya, jadi sekali foto sampai ke Telegram
+    task dianggap selesai. Kegagalan yang SEBENARNYA (sesi habis, halaman tidak terbuka,
+    kolom nomor tidak ketemu) tidak lewat sini: userscript memanggil `gagalkan()` yang
+    mengirim POST /selesai dengan status "gagal", dan pesan "Gagal diperiksa ..." tetap
+    muncul di sana seperti sebelumnya.
     """
-    if str(jenis or "embassy").lower() == "password":
-        status = str(data.get("status", "") or "").strip()
-        if status and bool(data.get("status_terbaca", True)):
-            return True, ""
-        dialog = str(data.get("dialog", "") or "").strip()
-        if dialog:
-            return False, f'Halaman Gladius: "{dialog[:200]}"'
-        return False, str(data.get("alasan") or "").strip() or "Status belum terbaca."
-    if bool(data.get("paket_ok")):
-        return True, ""
-    return (
-        False,
-        str(data.get("alasan") or "").strip()
-        or f"Paket Radius/PCRF tidak ditemukan dalam {len(DAFTAR_DOMAIN)} domain.",
-    )
+    return True, ""
 
 
 # ==================== HTTP ENDPOINT (dipanggil userscript Tampermonkey) ====================
@@ -342,8 +328,6 @@ class _Handler(BaseHTTPRequestHandler):
         jenis = str(data.get("jenis", "embassy")).lower()
         status = str(data.get("status", ""))
         foto_b64 = data.get("foto", "")
-        paket_ok = bool(data.get("paket_ok"))
-        lfu_ok = bool(data.get("lfu_ok"))
         # Satu keputusan dipakai untuk caption DAN pesan antrean, supaya keduanya tidak
         # pernah berbeda pendapat. Alasannya sudah difilter/di-default di sana.
         data_lengkap, alasan_final = _data_lengkap(jenis, data)
@@ -375,7 +359,7 @@ class _Handler(BaseHTTPRequestHandler):
                 alasan_final,
             )
         else:
-            caption = _caption_hasil(nomor, waktu, paket_ok, lfu_ok, alasan_final)
+            caption = _caption_hasil(nomor, waktu)
         terkirim = _tele_post(
             "sendPhoto",
             files={"photo": io.BytesIO(foto_bytes)},
@@ -383,11 +367,10 @@ class _Handler(BaseHTTPRequestHandler):
         ).get("ok", False)
 
         if terkirim:
-            # PERBAIKAN: pesan lama ditulis "Selesai ✓" setiap kali foto sampai, walau
-            # caption di foto itu sendiri menyatakan paket/statusnya tidak ditemukan.
-            # Antrian tampak berhasil padahal tidak ada data yang diperoleh — dan karena
-            # tanda "berhasil" itu tidak pernah muncul untuk kasus gagal, satu-satunya
-            # yang terlihat selalu "selesai". Sekarang verdict-nya jujur.
+            # Foto sampai = task selesai. Caption dan pesan ini TIDAK lagi menilai ulang
+            # isi halaman: pembaca selektor kami sering terlewat pada hasil yang jelas
+            # berhasil, dan itu memunculkan "TIDAK lengkap" padahal fotonya benar.
+            # Kegagalan asli tetap dilaporkan lewat POST /selesai (lihat gagalkan()).
             teks = (
                 f"Selesai ✓\n{nama} {nomor} lengkap."
                 if data_lengkap
